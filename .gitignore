@@ -3,3 +3,4 @@ data/
 __pycache__/
 *.db
 .env
+justificativa_exclusoes.txt

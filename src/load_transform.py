@@ -19,6 +19,11 @@ RAW_USINAS_DETAIL_DIR = Path("data/raw/raw_usinas_detail")
 DB_PATH = Path("data/warehouse/cv_case.db")
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
+# === NOVO: CAMINHO PARA SALVAR O ARQUIVO PARQUET TRATADO ===
+GOLD_OUTPUT_DIR = Path("data/modeled")
+GOLD_PARQUET_PATH = GOLD_OUTPUT_DIR / "fato_geracao_cv_tratado.parquet"
+# ==========================================================
+
 
 def load_duckdb(db_path: Path, raw_usinas_path: Path, raw_detail_path: Path):
     logger.info("Iniciando a fase LOAD no DuckDB lendo arquivos Parquet...")
@@ -260,43 +265,43 @@ def extrair_e_tratar_pandera(db_path: Path) -> pd.DataFrame:
             indices_falhos = failure_df['index'].dropna().unique().astype(int)
             df_falhas_originais = df.loc[indices_falhos]
             
-            # Vamos construir o arquivo TXT linha por linha de forma limpa
-            with open(arquivo_log, "w", encoding="utf-8") as f:
-                f.write("="*80 + "\n")
-                f.write("          RELATÓRIO DE JUSTIFICATIVA DE EXCLUSÃO DE REGISTROS (PANDERA)          \n")
-                f.write("="*80 + "\n\n")
-                f.write(f"Data do Processamento: {pd.Timestamp.now().strftime('%d/%m/%Y %H:%M:%S')}\n")
-                f.write(f"Total de Linhas com Inconsistências: {len(indices_falhos)}\n\n")
-                f.write("-"*80 + "\n")
+            # # Vamos construir o arquivo TXT linha por linha de forma limpa
+            # with open(arquivo_log, "w", encoding="utf-8") as f:
+            #     f.write("="*80 + "\n")
+            #     f.write("          RELATÓRIO DE JUSTIFICATIVA DE EXCLUSÃO DE REGISTROS (PANDERA)          \n")
+            #     f.write("="*80 + "\n\n")
+            #     f.write(f"Data do Processamento: {pd.Timestamp.now().strftime('%d/%m/%Y %H:%M:%S')}\n")
+            #     f.write(f"Total de Linhas com Inconsistências: {len(indices_falhos)}\n\n")
+            #     f.write("-"*80 + "\n")
                 
-                # Agrupamos os erros por índice para documentar todos os motivos caso uma linha tenha mais de um erro
-                for idx, grupo_erro in failure_df.groupby('index'):
-                    idx = int(idx)
-                    row_data = df.loc[idx]
+            #     # Agrupamos os erros por índice para documentar todos os motivos caso uma linha tenha mais de um erro
+            #     for idx, grupo_erro in failure_df.groupby('index'):
+            #         idx = int(idx)
+            #         row_data = df.loc[idx]
                     
-                    # Coleta metadados da linha para fácil identificação no negócio
-                    spe_nome = row_data.get('nome_spe_cv', 'N/A')
-                    timestamp = row_data.get('din_instante', 'N/A')
-                    if isinstance(timestamp, pd.Timestamp):
-                        timestamp = timestamp.strftime('%d/%m/%Y %H:%M')
+            #         # Coleta metadados da linha para fácil identificação no negócio
+            #         spe_nome = row_data.get('nome_spe_cv', 'N/A')
+            #         timestamp = row_data.get('din_instante', 'N/A')
+            #         if isinstance(timestamp, pd.Timestamp):
+            #             timestamp = timestamp.strftime('%d/%m/%Y %H:%M')
                     
-                    f.write(f"👉 LINHA DA BASE ORIGINAL (Índice: {idx}) | SPE: {spe_nome} | Instante: {timestamp}\n")
-                    f.write("   Motivos do Descarte:\n")
+            #         f.write(f"👉 LINHA DA BASE ORIGINAL (Índice: {idx}) | SPE: {spe_nome} | Instante: {timestamp}\n")
+            #         f.write("   Motivos do Descarte:\n")
                     
-                    for _, erro in grupo_erro.iterrows():
-                        coluna = erro['column']
-                        check_regra = erro['check']
-                        valor_errado = erro['failure_case']
+            #         for _, erro in grupo_erro.iterrows():
+            #             coluna = erro['column']
+            #             check_regra = erro['check']
+            #             valor_errado = erro['failure_case']
                         
-                        # Formata uma mensagem amigável dependendo se o erro foi de Nulo ou de Limite
-                        if pd.isna(valor_errado) or str(valor_errado).strip().lower() in ['nan', 'nat']:
-                            f.write(f"     ❌ Coluna [{coluna}]: O dado veio VAZIO (Nulo), mas a regra exige preenchimento obrigatório.\n")
-                        else:
-                            f.write(f"     ❌ Coluna [{coluna}]: Valor capturado '{valor_errado}' violou a regra [{check_regra}].\n")
+            #             # Formata uma mensagem amigável dependendo se o erro foi de Nulo ou de Limite
+            #             if pd.isna(valor_errado) or str(valor_errado).strip().lower() in ['nan', 'nat']:
+            #                 f.write(f"     ❌ Coluna [{coluna}]: O dado veio VAZIO (Nulo), mas a regra exige preenchimento obrigatório.\n")
+            #             else:
+            #                 f.write(f"     ❌ Coluna [{coluna}]: Valor capturado '{valor_errado}' violou a regra [{check_regra}].\n")
                             
-                    f.write("-"*80 + "\n")
+            #         f.write("-"*80 + "\n")
                     
-            print(f"ℹ️ Sucesso! Arquivo '{arquivo_log}' gerado com as justificativas detalhadas.")
+            # print(f"ℹ️ Sucesso! Arquivo '{arquivo_log}' gerado com as justificativas detalhadas.")
             
             # Aplica o drop final das linhas que falharam usando os índices rastreados
             df_clean = df.drop(index=indices_falhos)
@@ -366,6 +371,21 @@ def extrair_e_tratar_pandera(db_path: Path) -> pd.DataFrame:
                 gaps_relatorio.append(f" - {spe}: {count} descontinuidades reais encontradas.")
 
     # =====================================================================
+    # NOVO: SALVANDO A BASE TRATADA EM PARQUET (CAMINHO GOLD)
+    # =====================================================================
+    try:
+        # Garante que a pasta 'data/gold' existe
+        GOLD_PARQUET_PATH.parent.mkdir(parents=True, exist_ok=True)
+        
+        logger.info(f"Gravando arquivo Parquet tratado em: {GOLD_PARQUET_PATH}...")
+        # index=False evita criar uma coluna sem nome inútil para o Parquet
+        df_clean.to_parquet(GOLD_PARQUET_PATH, index=False, compression="snappy")
+        logger.info("Arquivo Parquet salvo com sucesso!")
+    except Exception as e:
+        logger.error(f"Erro ao salvar arquivo Parquet: {e}")
+        raise
+
+    # =====================================================================
     # RELATÓRIO FINAL EXPANDIDO
     # =====================================================================
     linhas_finais = len(df_clean)
@@ -398,9 +418,9 @@ def extrair_e_tratar_pandera(db_path: Path) -> pd.DataFrame:
     return df_clean
 
 if __name__ == "__main__":
-    #load_duckdb(DB_PATH, RAW_USINAS_DIR, RAW_USINAS_DETAIL_DIR)
-    #spes_cvd_data_extract(DB_PATH)
-    #filtrar_raw_usinas_conj(DB_PATH)
+    load_duckdb(DB_PATH, RAW_USINAS_DIR, RAW_USINAS_DETAIL_DIR)
+    spes_cvd_data_extract(DB_PATH)
+    filtrar_raw_usinas_conj(DB_PATH)
     relacionar_spe_conjunto(DB_PATH)
     #extrair_e_tratar_sql(DB_PATH)
     extrair_e_tratar_pandera(DB_PATH)
