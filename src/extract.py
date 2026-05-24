@@ -1,8 +1,9 @@
-import asyncio
-import httpx   #
-import logging #permite uma precisao maior na mostragem de erros (possui níveis de severidade, carimbos de tempo e salva o histórico)
+import os
+import requests
+import logging 
 import pandas as pd
 from pathlib import Path 
+from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
 
 #Configuração do logging
 logging.basicConfig(
@@ -10,73 +11,86 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
+RAW_USINAS_DIR = Path("data/raw/raw_usinas")
+RAW_USINAS_DIR.mkdir(parents=True, exist_ok=True)
 
-async def download_file(client: httpx.AsyncClient, url: str, caminho_destino: Path):
-    if caminho_destino.exists():
-        logging.info(f"O arquivo {caminho_destino.name} já existe.") #se o arquivo já foi baixado, ele não vai ser baixado novamente (idempotência)
-        return
+RAW_USINAS_DETAIL_DIR = Path("data/raw/raw_usinas_detail")
+RAW_USINAS_DETAIL_DIR.mkdir(parents=True, exist_ok=True)
 
-    try:
-        logging.info(f"Baixando {url}") #se houver um erro, o python interrompe a tarefa atual e pula pro except)
-
-        answer = await client.get(url)               # answer aqui ele pega o arquivo no url Usamos o 'await' (aguarde). Ele diz: "Pode ir baixar, Python. Enquanto você espera 
-                                                         # o servidor responder, vá fazer outras coisas e depois volte aqui".
-        answer.raise_for_status()              # se houver erro de 404 ou 500, a execução vai para os excepts
-
-        with open(caminho_destino, 'wb') as arquivo:
-            arquivo.write(answer.content)
-
-        logging.info(f"Feito! Arquivo salvo em: {caminho_destino}")
-
-    except httpx.HTTPStatusError as erro_http: #erro devido a falta do arquivo, link errado
-        logging.error(f"Erro no link {url}. Status: {erro_http.response.status_code}")
-    except httpx.RequestError as erro_req:     #erro devido a falta de internet, conexão falhou
-        logging.error(f"Erro de conexão ao tentar baixar {url}: {erro_req}")
-
-def generate_month_list(inicio: str, fim: str) -> list:
-    intervalo_meses = pd.date_range(start=f"{inicio}-01", end=f"{fim}-01", freq='MS') #pd.date_range gera uma sequência contínua de datas, freq MS = Month start
-    return intervalo_meses.strftime("%Y_%m").tolist()                                 #strftime = string format time ; .tolist() tira do formato pandas  e transforma em lista simples
-
-
-async def execute_extraction(data_inicio: str = "2025-10", data_fim: str = "2026-03"):
-    # 1. Geração inteligente da lista de meses ['2025-10', '2025-11', ...]
-    meses_alvo = generate_month_list(data_inicio, data_fim)
+#====================================================================
+# Geração dos parâmetros
+#====================================================================
+def generate_dynamic_month_list(qtd_meses: int = 6, defasagem_meses: int = 1) -> list:
+    """
+    Gera uma lista com os últimos X meses no formato YYYY_MM.
     
-    # 2. As URLs base com a marcação {mes} esperando para ser preenchida
-    url_base_usinas = "https://ons-aws-prod-opendata.s3.amazonaws.com/dataset/restricao_coff_eolica_tm/RESTRICAO_COFF_EOLICA_{mes}.csv"
-    url_base_detalhes = "https://ons-aws-prod-opendata.s3.amazonaws.com/dataset/restricao_coff_eolica_detail_tm/RESTRICAO_COFF_EOLICA_DETAIL_{mes}.csv"
+    Args:
+        qtd_meses: Quantidade de meses para buscar para trás.
+        defasagem_meses: Quantos meses ignorar a partir de hoje (1 = ignora o mês atual incompleto).
+    """
+    # 1. Descobre a data de hoje e subtrai a defasagem (ex: se hoje é Maio, ele volta para Abril)
+    data_referencia = pd.Timestamp.today() - pd.DateOffset(months=defasagem_meses)
     
-    # 3. Preparando o ambiente (criando a pasta se não existir)
-    pasta_raw = Path("data/raw")
-    pasta_raw.mkdir(parents=True, exist_ok=True)
+    # 2. Gera a sequência de datas. 
+    # O uso do parâmetro 'periods' em vez de 'start' diz ao Pandas: 
+    # "A partir da data de referência, volte X períodos exatos para trás".
+    intervalo_meses = pd.date_range(end=data_referencia, periods=qtd_meses, freq='MS')
     
-    logging.info(f"--- Iniciando Extração ONS ({data_inicio} até {data_fim}) ---")
-    
-    # 4. O Loop de Extração
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        tarefas = [] # Lista para guardar as nossas 12 missões
+    # 3. Converte para o formato de string exigido pela URL do ONS
+    return intervalo_meses.strftime("%Y_%m").tolist()
 
-        for mes in meses_alvo:
-            # --- Para o arquivo de Usinas ---
-            # A mágica acontece aqui: o '.format(mes=mes)' injeta '2025-10' na URL e no nome do arquivo
-            nome_usi = f"RESTRICAO_COFF_EOLICA_{mes}.csv"
-            url_usi = url_base_usinas.format(mes=mes)
-            caminho_usi = pasta_raw / nome_usi
+# Agora a sua variável se adapta sozinha ao tempo!
+COMPET = generate_dynamic_month_list()
+
+print("Meses que serão baixados:", COMPET)
+
+class S3DownloadError(Exception):
+    pass
+@retry(
+    wait=wait_exponential(multiplier=2, min=2, max=30),
+    stop=stop_after_attempt(5),
+    retry=retry_if_exception_type(requests.exceptions.ConnectionError)
+)
+
+def fetch_ons_data(base_url: str, filename_base: str, raw_data_path: str):
+    #Baixar o arquivo Parquet. Fallback sequencial para CSV e XLSV caso receba HTTP 404.
+    
+    formatos = [".parquet",".csv",".xlsx"]
+
+    for fmt in formatos:
+        url = f"{base_url}/{filename_base}{fmt}"
+        logging.info(f"Tentando extrair: {url}")
+        
+        try:
+            response = requests.get(url, timeout=15)
+            if response.status_code == 200:
+                file_path = raw_data_path / f"{filename_base}{fmt}"
+                with open(file_path, "wb") as f:
+                    f.write(response.content)
+                logging.info(f"Sucesso! Arquivo salvo em: {file_path}")
+                return True
+            elif response.status_code == 404:
+                logging.warning(f"Formato {fmt} não encontrado (HTTP 404). Tentando fallback...")
+                continue
+            else:
+                response.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Falha de conexão ao acessar {url}: {e}")
+            raise S3DownloadError(f"Erro na requisição: {e}")
             
-            tarefas.append(download_file(client, url_usi, caminho_usi))
-            
-            # --- Para o arquivo de Detalhamento ---
-            nome_det = f"RESTRICAO_COFF_EOLICA_DETAIL_{mes}.csv"
-            url_det = url_base_detalhes.format(mes=mes)
-            caminho_det = pasta_raw / nome_det
-            
-            tarefas.append(download_file(client, url_det, caminho_det))
+    logging.error(f"Nenhum formato disponível para {filename_base}.")
+    return False
 
-        await asyncio.gather(*tarefas)
+def executar_extracao():
+    url_complexos = "https://ons-aws-prod-opendata.s3.amazonaws.com/dataset/restricao_coff_eolica_tm"
+    url_spes = "https://ons-aws-prod-opendata.s3.amazonaws.com/dataset/restricao_coff_eolica_detail_tm"
+    
+    # Agora o laço itera sobre a lista gerada dinamicamente pela sua função
+    for comp in COMPET:
+        # Extração Conjuntos/Complexos
+        fetch_ons_data(url_complexos, f"RESTRICAO_COFF_EOLICA_{comp}", RAW_USINAS_DIR)
+        # Extração SPEs/Detalhamento
+        fetch_ons_data(url_spes, f"RESTRICAO_COFF_EOLICA_DETAIL_{comp}", RAW_USINAS_DETAIL_DIR)
 
-    logging.info("--- Extração Finalizada ---")
-
-# Ponto de entrada do script
 if __name__ == "__main__":
-    #execute_extraction()
-    asyncio.run(execute_extraction()) # Como a função principal agora é async, usamos o asyncio.run para dar a ignição inicial
+    executar_extracao()

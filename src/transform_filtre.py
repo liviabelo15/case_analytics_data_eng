@@ -1,136 +1,229 @@
 import pandas as pd
+import duckdb
 import json
+import pandera.pandas as pa
+from pandera.pandas import Column, Check
 from pathlib import Path
 import logging
+import re
 
-# Configuração do nosso diário de bordo
+# =============================================================================
+# 0. CONFIGURAÇÕES INICIAIS
+# =============================================================================
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def validar_schema_com_json(df: pd.DataFrame, caminho_json: Path, nome_dataset: str):
-    """
-    Lê o dicionário JSON oficial do ONS e valida se o CSV contém todas as colunas exigidas.
-    """
+RAW_DIR = Path("data/raw")
+MODELED_DIR = Path("data/modeled")
+MODELED_DIR.mkdir(parents=True, exist_ok=True)
+
+# =============================================================================
+# PASSO 1: EXTRAÇÃO (LOAD DA LANDING ZONE)
+# =============================================================================
+
+def extrair_dados_brutos():
+    logging.info("Iniciando leitura dos arquivos brutos no Pandas...")
+    
+    arquivos_spe = list(RAW_DIR.glob("*DETAIL*.parquet"))
+    arquivos_complexo = list(RAW_DIR.glob("*RESTRICAO_COFF_EOLICA_2*.parquet"))
+    
+    df_spe = pd.concat([pd.read_parquet(f) for f in arquivos_spe], ignore_index=True)
+    df_complexo = pd.concat([pd.read_parquet(f) for f in arquivos_complexo], ignore_index=True)
+    df_mestre = pd.read_csv("spes_casa_dos_ventos.csv", sep=",")
+
+    return df_spe, df_complexo, df_mestre
+
+# =============================================================================
+# PASSO 2: FILTRAGEM (EARLY FILTERING) 
+# =============================================================================
+
+def filtro_spe_cdv(df_spe, df_complexo, df_mestre):
+    logging.info("Aplicando Early Filtering - SPEs CDV")
+
+    lista_cegs_mestre = df_mestre['ceg'].dropna().astype(str).str.strip().tolist()
+
+    df_spe['ceg_limpo'] = df_spe['ceg'].astype(str).str.extract(r'(\d+-\d)', expand=False)
+
+
+    df_spe = df_spe[df_spe['ceg_limpo'].isin(lista_cegs_mestre)].copy()
+    df_spe['ceg'] = df_spe['ceg_limpo']
+    df_spe = df_spe.drop(columns=['ceg_limpo'])
+
+    df_spe['complexo_derivado_chave'] = df_spe['nom_usina'].apply(extrair_radical)
+    df_complexo['complexo_derivado_chave'] = df_complexo['nom_usina'].apply(extrair_radical)
+
+    complexos_cdv = df_spe['complexo_derivado_chave'].unique()
+    df_complexo = df_complexo[df_complexo['complexo_derivado_chave'].isin(complexos_cdv)].copy()
+
+    return df_spe, df_complexo
+
+# =============================================================================
+# PASSO 3: LIMPEZA, TIPAGEM E REGRAS DE NEGÓCIO (REGULATÓRIO ONS)
+# =============================================================================
+
+def limpeza_e_tipagem_dados(df_spe, df_complexo):
+    """Aplica tipagem correta, remove gaps temporais e descarta dados corrompidos."""
+    logging.info("[PASSO 3] Aplicando tipagem e descartando anemometria inválida...")
+    
+    # Renomeia ID para evitar colisão
+    df_spe = df_spe.rename(columns={'id_ons': 'spe_id_ons'})
+
+    # Tipagem de Datas
+    df_spe['din_instante'] = pd.to_datetime(df_spe['din_instante'])
+    df_complexo['din_instante'] = pd.to_datetime(df_complexo['din_instante'])
+
+    # Validação de Gaps Temporais (30 min)
+    df_sorted = df_spe.sort_values(by=['nom_usina', 'din_instante']).copy()
+    df_sorted['delta_tempo'] = df_sorted.groupby('nom_usina')['din_instante'].diff()
+    gaps = df_sorted[df_sorted['delta_tempo'].notna() & (df_sorted['delta_tempo'] != pd.Timedelta(minutes=30))]
+    
+    if not gaps.empty:
+        logging.warning(f"ATENÇÃO: Detectados {len(gaps)} quebras de continuidade temporal!")
+    df_spe = df_sorted.drop(columns=['delta_tempo'])
+
+    # Filtro Regulatório (Flag de Vento Inválido)
+    if 'flg_dadoventoinvalido' in df_spe.columns:
+        df_spe['flg_dadoventoinvalido'] = pd.to_numeric(df_spe['flg_dadoventoinvalido'], errors='coerce')
+        df_spe = df_spe[(df_spe['flg_dadoventoinvalido'] != 1.0) | (df_spe['flg_dadoventoinvalido'].isna())].copy()
+
+    # Coerção Numérica (Mantendo nulos permitidos pelo dicionário)
+    for col in ["val_geracaoverificada", "val_ventoverificado", "flg_dadoventoinvalido", "val_geracaoestimada"]:
+        if col in df_spe.columns: df_spe[col] = pd.to_numeric(df_spe[col], errors='coerce').astype('float64')
+            
+    for col in ["val_geracaolimitada", "val_geracaoreferenciafinal"]:
+        if col in df_complexo.columns: df_complexo[col] = pd.to_numeric(df_complexo[col], errors='coerce').astype('float64')
+
+    return df_spe, df_complexo
+
+# =============================================================================
+# PASSO 4: VALIDAÇÃO DE QUALIDADE (PANDERA E RELATÓRIO)
+# =============================================================================
+def gerar_relatorio_qualidade(df: pd.DataFrame, nome_base: str):
+    """Imprime estatísticas de completude (nulos e zeros)."""
+    total = len(df)
+    if total == 0:
+        return logging.warning(f"A base {nome_base} está vazia!")
+        
+    logging.info(f"--- Relatório: {nome_base} ({total} registros) ---")
+    
+    # Avalia nulos
+    nulos = df.isnull().sum()
+    for col, qtd in nulos[nulos > 0].items():
+        logging.info(f"  * Nulos em {col}: {qtd} ({(qtd / total) * 100:.2f}%)")
+        
+    # Avalia zeros nas colunas numéricas
+    num_cols = df.select_dtypes(include=['float64', 'int64']).columns
+    zeros = (df[num_cols] == 0).sum()
+    for col, qtd in zeros[zeros > 0].items():
+        logging.info(f"  * Zeros em {col}: {qtd} ({(qtd / total) * 100:.2f}%)")
+
+def validar_matematica_dos_dados(df_spe, df_complexo):
+    """Usa Pandera para garantir que leis da física e termodinâmica não foram violadas."""
+    logging.info("[PASSO 4] Acionando validação rigorosa (Pandera)...")
+    
+    schema_spe = pa.DataFrameSchema({
+        "val_geracaoverificada": Column(float, Check.greater_than_or_equal_to(0.0), nullable=True),
+        "val_ventoverificado": Column(float, Check.in_range(0.0, 40.0), nullable=True),
+        "flg_dadoventoinvalido": Column(float, Check.isin([0.0, 1.0]), nullable=True),
+        "val_geracaoestimada": Column(float, Check.greater_than_or_equal_to(0.0), nullable=True)
+    })
+
+    schema_complexo = pa.DataFrameSchema(
+        columns={
+            "val_geracaolimitada": Column(float, Check.greater_than_or_equal_to(0.0), nullable=True),
+            "val_geracaoreferenciafinal": Column(float, Check.greater_than_or_equal_to(0.0), nullable=True)
+        },
+        checks=pa.Check(
+            lambda df: df["val_geracaolimitada"] <= df["val_geracaoreferenciafinal"],
+            name="check_proporcao_limitante", ignore_na=True
+        )
+    )
+
     try:
-        with open(caminho_json, 'r', encoding='utf-8') as f:
-            dicionario = json.load(f)
+        df_spe = schema_spe.validate(df_spe)
+        df_complexo = schema_complexo.validate(df_complexo)
+        
+        gerar_relatorio_qualidade(df_spe, "Detalhamento (SPE)")
+        gerar_relatorio_qualidade(df_complexo, "Geral (Complexos)")
+        return df_spe, df_complexo
+        
+    except pa.errors.SchemaError as e:
+        logging.error(f"Erro Crítico de Qualidade: {e}")
+        raise
+
+# =============================================================================
+# PASSO 5: MODELAGEM DIMENSIONAL ELT (DUCKDB)
+# =============================================================================
+def executar_modelagem_duckdb(df_spe, df_complexo, df_mestre):
+    """Realiza o Join e traduz os nomes das colunas usando SQL em memória."""
+    logging.info("[PASSO 5] Modelando Star Schema no DuckDB e salvando Parquet...")
+    
+    con = duckdb.connect(database=':memory:')
+    con.register('tb_spe', df_spe)
+    con.register('tb_complexo', df_complexo)
+    con.register('tb_mestre', df_mestre)
+    
+    query_fato = """
+        CREATE TABLE fato_restricao AS
+        SELECT 
+            s.din_instante,
+            m.projeto,
+            m.ceg,
+            s.spe_id_ons,
+            c.cod_razaorestricao,
+            c.cod_origemrestricao,
+            c.dsc_restricao,
             
-        # Extrai todos os "codigos" (nomes das colunas) da lista do dicionário
-        colunas_esperadas = [item["codigo"] for item in dicionario["dicionario_simplificado"]]
-        
-        # Compara as colunas do Pandas com as colunas do Dicionário
-        colunas_faltantes = [col for col in colunas_esperadas if col not in df.columns]
-        
-        if colunas_faltantes:
-            logging.error(f"[{nome_dataset}] ALERTA ESTRUTURAL: Faltam colunas no CSV: {colunas_faltantes}")
-        else:
-            logging.info(f"[{nome_dataset}] Validação Estrutural: Sucesso! Todas as {len(colunas_esperadas)} colunas oficiais estão presentes.")
+            -- TRADUÇÃO DAS MÉTRICAS PARA A ÁREA DE NEGÓCIOS:
+            s.val_geracaoverificada AS val_geracao,
+            c.val_geracaolimitada,
+            c.val_geracaoreferenciafinal AS val_geracaoreferencia,
+            s.val_ventoverificado AS velocidade_do_vento,
             
-    except FileNotFoundError:
-        logging.warning(f"Arquivo JSON não encontrado em {caminho_json}. Pulando validação de schema.")
-
-
-def consolidar_arquivos(pasta: Path, padrao_nome: str, colunas_de_data: list = None) -> pd.DataFrame:
+            EXTRACT(YEAR FROM s.din_instante) AS ano,
+            EXTRACT(MONTH FROM s.din_instante) AS mes
+        FROM tb_spe s
+        INNER JOIN tb_mestre m ON s.ceg = m.ceg 
+        LEFT JOIN tb_complexo c 
+            ON s.complexo_derivado_chave = c.complexo_derivado_chave 
+            AND s.din_instante = c.din_instante
     """
-    Busca arquivos numa pasta por um padrão, lê tratando encoding/delimitadores e empilha num único DataFrame.
+    con.execute(query_fato)
+    
+    query_dim_projeto = """
+        CREATE TABLE dim_projeto_spe AS
+        SELECT DISTINCT m.ceg, m.projeto, m.spe, s.nom_usina, s.id_estado, s.nom_estado, s.id_subsistema
+        FROM tb_mestre m
+        JOIN tb_spe s ON s.ceg = m.ceg
     """
-    arquivos = list(pasta.glob(padrao_nome))
-    if not arquivos:
-        logging.warning(f"Nenhum arquivo encontrado com o padrão: {padrao_nome}")
-        return pd.DataFrame() 
-
-    lista_tabelas = []
-    for caminho in arquivos:
-        logging.info(f"Lendo: {caminho.name}")
-        # Lendo o CSV com as configurações para o padrão brasileiro
-        df = pd.read_csv(caminho, sep=';', encoding='utf-8', decimal=',', parse_dates=colunas_de_data)
-        lista_tabelas.append(df)
-        
-    return pd.concat(lista_tabelas, ignore_index=True)
+    con.execute(query_dim_projeto)
+    
+    # Persistência Otimizada via Parquet Particionado
+    con.execute(f"COPY fato_restricao TO '{MODELED_DIR}/fato_restricao' (FORMAT PARQUET, PARTITION_BY (ano, mes, projeto), OVERWRITE_OR_IGNORE 1);")
+    con.execute(f"COPY dim_projeto_spe TO '{MODELED_DIR}/dim_projeto_spe.parquet' (FORMAT PARQUET);")
+    logging.info("Pipeline concluído com sucesso!")
 
 
-def aplicar_qualidade_dados(df: pd.DataFrame, nome_dataset: str, is_detalhamento: bool = False) -> pd.DataFrame:
-    """
-    Limpa os dados (nulos, duplicatas, tipagem) e aplica regras de negócio específicas.
-    """
-    logging.info(f"\n================ RELATÓRIO DE QUALIDADE: {nome_dataset} ================")
-    linhas_antes = len(df)
+# =============================================================================
+# ORQUESTRADOR PRINCIPAL (EXECUÇÃO PASSO A PASSO)
+# =============================================================================
+def main():
+    logging.info("=== INICIANDO PIPELINE DE DADOS ===")
     
-    # 1. Consistência de Tipos: Forçar colunas numéricas
-    colunas_numericas = [col for col in df.columns if col.startswith('val_')]
-    for col in colunas_numericas:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-
-    # 2. Relatório de Nulos
-    pct_nulos = (df.isnull().mean() * 100).round(2)
-    colunas_com_nulos = pct_nulos[pct_nulos > 0]
-    if not colunas_com_nulos.empty:
-        logging.warning(f"Percentual de Nulos por coluna:\n{colunas_com_nulos.astype(str) + '%'}")
-
-    # 3. Tratamento de Nulos em Colunas Chave
-    colunas_chave = ['din_instante', 'id_ons'] 
-    colunas_existentes = [c for c in colunas_chave if c in df.columns]
-    df = df.dropna(subset=colunas_existentes)
+    # 1. Extração
+    df_spe, df_complexo, df_mestre = extrair_dados_brutos()
     
-    # 4. Tratamento de Duplicatas
-    duplicatas = df.duplicated().sum()
-    if duplicatas > 0:
-        logging.warning(f"Encontradas {duplicatas} linhas duplicadas. Removendo...")
-        df = df.drop_duplicates()
-
-    # 5. Regra de Negócio: Filtro de Vento (Apenas Detalhamento)
-    if is_detalhamento:
-        coluna_flag = 'flg_dadoventoinvalido'
-        if coluna_flag in df.columns:
-            invalidos_antes = len(df)
-            # Dicionário diz: flag = 1 é INVÁLIDO. Mantemos apenas os diferentes de 1.
-            df = df[df[coluna_flag] != 1] 
-            ventos_descartados = invalidos_antes - len(df)
-            logging.info(f"Ventos inválidos descartados (flag=1): {ventos_descartados}")
-        else:
-            logging.warning(f"Coluna de flag '{coluna_flag}' não encontrada!")
-
-    linhas_depois = len(df)
-    logging.info(f"RESUMO: Linhas originais: {linhas_antes} | Descartadas: {linhas_antes - linhas_depois} | Finais: {linhas_depois}")
-    logging.info("====================================================================\n")
+    # 2. Filtragem e Padronização
+    df_spe, df_complexo = filtro_spe_cdv(df_spe, df_complexo, df_mestre)
     
-    return df
-
-
-def executar_transformacao():
-    pasta_raw = Path("data/raw")
-    pasta_processed = Path("data/processed")
-    pasta_dicionarios = Path("data/dict")
+    # 3. Limpeza
+    df_spe, df_complexo = limpeza_e_tipagem_dados(df_spe, df_complexo)
     
-    # Cria a pasta de saída se não existir
-    pasta_processed.mkdir(parents=True, exist_ok=True)
+    # 4. Validação
+    df_spe, df_complexo = validar_matematica_dos_dados(df_spe, df_complexo)
     
-    logging.info("--- Iniciando Consolidação ---")
-    df_usinas = consolidar_arquivos(pasta_raw, "RESTRICAO_COFF_EOLICA_20*.csv", ['din_instante'])
-    df_detalhes = consolidar_arquivos(pasta_raw, "RESTRICAO_COFF_EOLICA_DETAIL_20*.csv", ['din_instante'])
-    
-    # Validação de Schema com JSON
-    # Certifique-se de que os nomes dos arquivos JSON batem com o que você salvou na pasta data/dict
-    json_usinas = pasta_dicionarios / "DicionarioDados_RestricaoContrainedoff_UsiEolicas.json"
-    json_detalhes = pasta_dicionarios / "DicionarioDados_RestricaoContrainedoff_UsiEolicas_DetalhamentoPorUsina.json"
-    
-    validar_schema_com_json(df_usinas, json_usinas, "DATASET USINAS")
-    validar_schema_com_json(df_detalhes, json_detalhes, "DATASET DETALHAMENTO")
-    
-    # Qualidade e Limpeza
-    df_usinas = aplicar_qualidade_dados(df_usinas, "DATASET USINAS", is_detalhamento=False)
-    df_detalhes = aplicar_qualidade_dados(df_detalhes, "DATASET DETALHAMENTO", is_detalhamento=True)
-    
-    # Persistência no disco em formato Parquet
-    caminho_usinas = pasta_processed / "usinas_consolidadas.parquet"
-    caminho_detalhes = pasta_processed / "detalhes_consolidados.parquet"
-    
-    logging.info(f"Salvando base de Usinas em: {caminho_usinas}")
-    df_usinas.to_parquet(caminho_usinas, index=False)
-    
-    logging.info(f"Salvando base de Detalhamento em: {caminho_detalhes}")
-    df_detalhes.to_parquet(caminho_detalhes, index=False)
-    
-    logging.info("--- Transformação Concluída com Sucesso! ---")
+    # 5. Carga e Modelagem
+    executar_modelagem_duckdb(df_spe, df_complexo, df_mestre)
 
 if __name__ == "__main__":
-    executar_transformacao()
+    main()
