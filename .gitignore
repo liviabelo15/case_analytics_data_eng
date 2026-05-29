@@ -4,3 +4,4 @@ __pycache__/
 *.db
 .env
 relatorio_qualidade.json
+spes_casa_dos_ventos.csv
