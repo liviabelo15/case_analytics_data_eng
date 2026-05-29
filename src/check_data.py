@@ -1,3 +1,15 @@
+# ==============================================================================
+# NOME DO SCRIPT: check_warehouse.py (ou profiling.py)
+# AUTOR:          Lívia Belo
+# DATA DA VERSÃO: Maio de 2026
+# VERSÃO:         1.0.0
+# DESCRIPTION:    Script de Diagnóstico e Perfilamento de Dados (Data Profiling).
+#                 Explora a integridade das tabelas armazenadas no DuckDB (camadas 
+#                 Bronze e Interim), extraindo métricas de volumetria total, 
+#                 estrutura e tipagem de colunas (Schema), amostras de registros 
+#                 e auditoria de linhagem por arquivo de origem (filename).
+# ==============================================================================
+
 import duckdb
 import pandas as pd
 

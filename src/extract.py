@@ -1,3 +1,15 @@
+# ==============================================================================
+# NOME DO SCRIPT: extract.py 
+# AUTOR:          Lívia Belo
+# DATA DA VERSÃO: Maio de 2026
+# VERSÃO:         1.0.0
+# DESCRIPTION:    Pipeline de Ingestão e Extração (E) automatizado para coleta 
+#                 de dados brutos de restrição eólica do open data do ONS (S3). 
+#                 Possui geração dinâmica de safras retroativas, resiliência a 
+#                 falhas de rede via retry (backoff exponencial) e política de 
+#                 fallback de formatos (.parquet -> .csv -> .xlsx) para a camada Raw.
+# ==============================================================================
+
 import os
 import requests
 import logging 
