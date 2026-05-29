@@ -1,5 +1,5 @@
 # ==============================================================================
-# NOME DO SCRIPT: check_warehouse.py (ou profiling.py)
+# NOME DO SCRIPT: check_data.py
 # AUTOR:          Lívia Belo
 # DATA DA VERSÃO: Maio de 2026
 # VERSÃO:         1.0.0
