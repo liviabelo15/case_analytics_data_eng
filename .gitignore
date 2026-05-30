@@ -5,3 +5,4 @@ __pycache__/
 .env
 relatorio_qualidade.json
 spes_casa_dos_ventos.csv
+load_transform_original.py
