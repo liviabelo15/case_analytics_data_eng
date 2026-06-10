@@ -24,10 +24,7 @@ logging.basicConfig(
 )
 
 RAW_USINAS_DIR = Path("data/raw/raw_usinas")
-RAW_USINAS_DIR.mkdir(parents=True, exist_ok=True)
-
 RAW_USINAS_DETAIL_DIR = Path("data/raw/raw_usinas_detail")
-RAW_USINAS_DETAIL_DIR.mkdir(parents=True, exist_ok=True)
 
 #====================================================================
 # Geração dos parâmetros
@@ -51,17 +48,14 @@ def generate_dynamic_month_list(qtd_meses: int = 6, defasagem_meses: int = 1) ->
     # 3. Converte para o formato de string exigido pela URL do ONS
     return intervalo_meses.strftime("%Y_%m").tolist()
 
-# Agora a sua variável se adapta sozinha ao tempo!
 COMPET = generate_dynamic_month_list()
-
-print("Meses que serão baixados:", COMPET)
 
 class S3DownloadError(Exception):
     pass
 @retry(
     wait=wait_exponential(multiplier=2, min=2, max=30),
     stop=stop_after_attempt(5),
-    retry=retry_if_exception_type(requests.exceptions.ConnectionError)
+    retry=retry_if_exception_type(S3DownloadError)
 )
 
 def fetch_ons_data(base_url: str, filename_base: str, raw_data_path: str):
@@ -74,11 +68,12 @@ def fetch_ons_data(base_url: str, filename_base: str, raw_data_path: str):
         logging.info(f"Tentando extrair: {url}")
         
         try:
-            response = requests.get(url, timeout=15)
+            response = requests.get(url, timeout=60, stream=True)
             if response.status_code == 200:
                 file_path = raw_data_path / f"{filename_base}{fmt}"
                 with open(file_path, "wb") as f:
-                    f.write(response.content)
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        f.write(chunk)
                 logging.info(f"Sucesso! Arquivo salvo em: {file_path}")
                 return True
             elif response.status_code == 404:
@@ -94,10 +89,13 @@ def fetch_ons_data(base_url: str, filename_base: str, raw_data_path: str):
     return False
 
 def executar_extracao():
+    RAW_USINAS_DIR.mkdir(parents=True, exist_ok=True)
+    RAW_USINAS_DETAIL_DIR.mkdir(parents=True, exist_ok=True)
+
     url_complexos = "https://ons-aws-prod-opendata.s3.amazonaws.com/dataset/restricao_coff_eolica_tm"
     url_spes = "https://ons-aws-prod-opendata.s3.amazonaws.com/dataset/restricao_coff_eolica_detail_tm"
-    
-    # Agora o laço itera sobre a lista gerada dinamicamente pela sua função
+
+    logging.info(f"Meses que serão baixados: {COMPET}")
     for comp in COMPET:
         # Extração Conjuntos/Complexos
         fetch_ons_data(url_complexos, f"RESTRICAO_COFF_EOLICA_{comp}", RAW_USINAS_DIR)
