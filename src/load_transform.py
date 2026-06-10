@@ -405,10 +405,7 @@ def extrair_e_tratar_pandera(db_path: Path) -> pd.DataFrame:
 
     # =========================================================
     # COMPLETUDE POR PROJETO
-    # Denominador FIXO: período esperado da coleta (não derivado dos dados).
-    # Usar o range observado como denominador sempre dá ~100% — é como medir
-    # sua própria altura contra você mesmo. O denominador certo é o período
-    # contratado (out/2025–mar/2026), independente do que chegou.
+    # Denominador FIXO: período esperado da coleta.
     # =========================================================
     completude_proj = {}
     if 'din_instante' in df_clean.columns and 'projeto_cv' in df_clean.columns and not df_clean.empty:
