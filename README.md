@@ -14,24 +14,26 @@ Este pipeline baixa esses arquivos automaticamente, une os dois datasets, valida
 
 ---
 
-## Arquitetura: Camadas Bronze → Silver → Gold
+## Arquitetura: ELT com Camadas Bronze → Silver → Gold
+
+O pipeline segue o padrão **ELT** (Extract → Load → Transform): os dados são carregados primeiro no DuckDB e as transformações são feitas em SQL dentro do banco, aproveitando o motor analítico colunar para joins e agregações eficientes.
 
 ```
 ONS (S3)
    │
    ▼
-[extract.py]  ──────────────────────────────────── Camada Bronze
+[extract.py]  ──────────────────────────────────── Camada Bronze (Extract)
    │  Baixa os arquivos Parquet do ONS e salva em data/raw/
    │
    ▼
-[load_transform.py]  ────────────────────────────── Camada Silver
-   │  Une os dois datasets, aplica regras de qualidade,
-   │  valida com Pandera e gera relatorio_qualidade.json
+[load_transform.py]  ────────────────────────────── Camada Silver (Load + Transform)
+   │  Carrega no DuckDB, une os dois datasets via SQL,
+   │  aplica regras de qualidade e valida com Pandera
    │  Saída: data/modeled/fato_geracao_cv_tratado.parquet
    │
    ▼
-[model.py]  ─────────────────────────────────────── Camada Gold
-   │  Constrói o modelo dimensional (Star Schema)
+[model.py]  ─────────────────────────────────────── Camada Gold (Transform)
+   │  Constrói o modelo dimensional (Star Schema) em SQL
    │  Saída: 6 tabelas no banco data/warehouse/cv_case.db
    │
    ▼
@@ -113,21 +115,40 @@ Os códigos de restrição (REL, CNF, ENE, PAR) e origens (LOC, SIS) são defini
 
 ---
 
-## Instalação
+## Instalação e execução rápida
 
-**Pré-requisito:** Python 3.10 ou superior.
+**Pré-requisito:** Python 3.10 ou superior e Git instalados.
+
+O script `setup_project.sh` automatiza todo o processo: clona o repositório, cria o ambiente virtual, instala as dependências e executa o pipeline completo.
 
 ```bash
-# Clone o repositório
-git clone https://github.com/seu-usuario/case_analytics_data_eng.git
+bash setup_project.sh
+```
+
+Ou, se quiser que o terminal já entre na pasta do projeto ao terminar:
+
+```bash
+source setup_project.sh
+```
+
+Ao final, o script exibe as instruções para iniciar a API.
+
+> **Windows:** use o Git Bash ou o WSL para executar o script `.sh`.
+
+---
+
+## Instalação manual (opcional)
+
+Caso prefira executar as etapas individualmente:
+
+```bash
+git clone https://github.com/liviabelo15/case_analytics_data_eng.git
 cd case_analytics_data_eng
 
-# Crie e ative o ambiente virtual
-python -m venv venv
+python3 -m venv venv
 source venv/bin/activate        # Linux/Mac
 # venv\Scripts\activate         # Windows
 
-# Instale as dependências
 pip install -r requirements.txt
 ```
 
