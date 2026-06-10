@@ -1,185 +1,263 @@
-# 📑 Case Data Engineering & Analytics — Casa dos Ventos & ONS
+# Case Data Engineering & Analytics — Casa dos Ventos & ONS
 
-Este repositório contém a solução completa para o pipeline de dados de alta performance focado na consolidação, auditoria de qualidade e modelagem analítica dos dados de **Restrição de Geração (*Constrained-off*) de Usinas Eólicas**. [cite_start]O ecossistema processa dados brutos disponibilizados pelo ONS e unifica-os com o mapeamento cadastral interno da Casa dos Ventos[cite: 1].
+Pipeline de dados para consolidação, qualidade e análise dos dados de **restrição de geração (constrained-off) de parques eólicos**, integrando dados abertos do ONS com o cadastro interno da Casa dos Ventos.
 
 ---
 
-## 🏗️ 1. Arquitetura da Solução
+## O que este projeto faz
 
-O ecossistema foi desenhado seguindo a **Arquitetura de Medalhão** moderna baseada em um **Data Lakehouse local e sem servidor (Serverless)**, garantindo processamento vetorizado de alta velocidade e desacoplamento de infraestrutura rígida.
+O ONS publica mensalmente dois datasets sobre restrições de geração eólica:
+- **Dataset 1 (Conjuntos):** métricas elétricas por complexo — geração total, limitações, disponibilidade e motivo da restrição.
+- **Dataset 2 (SPEs):** métricas físicas por aerogerador individual — velocidade do vento, geração estimada e verificada.
 
-```text
-  [ ONS API / Parquet ]       [ CSV Mestre CDV ]
-            |                          |
-            v                          v
-   +---------------------------------------+
-   |  Camada BRONZE (Ingestão Raw)        | -> Tabelas: raw_usinas, raw_usinas_detail
-   +---------------------------------------+
-            |
-            v (SQL Otimizado via DuckDB)
-   +---------------------------------------+
-   |  Camada SILVER (Limpeza & Filtros)    | -> Tabelas: int_usinas_cv, int_cv_conj
-   +---------------------------------------+
-            |
-            v (Validação Algorítmica & Contratos de Dados)
-   +---------------------------------------+
-   |  Camada GOLD (Modelagem Star Schema)  | -> Parquets: fato_geracao_restricao, dim_ativo_eolico, dim_tempo
-   +---------------------------------------+
-            |
-            v
-       [ FastAPI ] -> Camada de Serviço / Endpoint REST
+Este pipeline baixa esses arquivos automaticamente, une os dois datasets, valida a qualidade dos dados, constrói um modelo dimensional para análise e expõe os resultados via API REST.
+
+---
+
+## Arquitetura: Camadas Bronze → Silver → Gold
 
 ```
-
-### 🛠️ Stack Tecnológica Central
-
-* **DuckDB:** Motor analítico colunar em memória para transformações SQL ultra rápidas de bases volumétricas.
-* **Pandas & Apache Arrow:** Manipulação estruturada de dataframes e compartilhamento de memória com *Zero-Copy*.
-* **Pandera:** Framework para aplicação de **Contratos de Dados (Data Contracts)** rígidos e validação estatística.
-* **FastAPI & Uvicorn:** Camada de serviço de baixa latência para exposição dos dados modelados via API REST.
-* **Parquet (Snappy):** Formato de armazenamento colunar otimizado para compressão de disco e leitura analítica rápida.
-
----
-
-## 🧠 2. Premissas e Decisões de Design
-
-### 🔹 Migração Estratégica: De Snowflake para Star Schema Supremo
-
-Os dados originais do ONS seguem intrinsecamente um modelo normalizado (*Snowflake Schema*), no qual atributos de usinas, conjuntos operacionais e localizações geográficas encontram-se fragmentados e dependentes de múltiplos relacionamentos em cadeia.
-
-Para otimizar o consumo por ferramentas de Business Intelligence (como Power BI e Looker) e queries de Analytics, o pipeline realiza uma **desnormalização proposital** na camada Gold, consolidando um **Star Schema** puro composto por apenas três tabelas de alto desempenho:
-
-1. **`fato_geracao_restricao`**: Tabela central contendo as métricas de geração (MWmed), restrições, velocidade do vento e sinalizações de alertas.
-2. **`dim_ativo_eolico`**: Dimensão totalmente achatada que serve como cadastro estável unificado de todos os níveis organizacionais (Projeto, Conjunto, SPE/Usina e Localização).
-3. **`dim_tempo`**: Calendário analítico detalhado para quebras dinâmicas de séries temporais de 30 em 30 minutos.
-
-### 🔹 Framework Híbrido de Qualidade: Hard Drop vs. Soft Drop vs. Flagging
-
-Para garantir a confiabilidade cega dos relatórios executivos entregues à diretoria, foi implementada uma triagem tripla contra anomalias de dados:
-
-* **Hard Drop (Descarte Crítico):** Registros duplicados na mesma chave composta ou linhas que violam o contrato estrutural mínimo exigido pelo Pandera são sumariamente expurgados da base útil para não distorcer agregações, gerando um registro descritivo no arquivo `relatorio_qualidade.json`.
-* **Soft Drop (Anulação de Célula):** Medições físicas absurdas (ex: velocidade do vento negativa ou superior a 40 m/s, ou falha explícita de telemetria) são convertidas para `NULL`. Isso preserva o restante das informações financeiras/contábeis da linha sem invalidar o registro inteiro.
-* **Flagging (Sinalização de Negócio):** Inconsistências de regras de negócio (como quando o volume de energia limitado/cortado pelo ONS sob uma restrição supera a própria geração de referência calculada para o ativo) são mantidas na base, mas recebem uma flag binária (`flg_alerta_limitada = 1`) para auditoria imediata pelo time de operações.
-
-### 🔹 Governança Cadastral e Preservação de Ativos (Balanço de Massa)
-
-Para evitar que usinas recém-comissionadas ou ativos sem geração reportada no mês sumissem dos filtros de mercado, a dimensão `dim_ativo_eolico` utiliza como âncora soberana o arquivo de sementes internas `spes_casa_dos_ventos.csv`. Através de um `LEFT JOIN` resiliente com a base de telemetria, assegura-se que a dimensão contenha perfeitamente a integridade de todos os **47 ativos eólicos cadastrados**, blindando a modelagem contra perdas ocultas de histórico.
+ONS (S3)
+   │
+   ▼
+[extract.py]  ──────────────────────────────────── Camada Bronze
+   │  Baixa os arquivos Parquet do ONS e salva em data/raw/
+   │
+   ▼
+[load_transform.py]  ────────────────────────────── Camada Silver
+   │  Une os dois datasets, aplica regras de qualidade,
+   │  valida com Pandera e gera relatorio_qualidade.json
+   │  Saída: data/modeled/fato_geracao_cv_tratado.parquet
+   │
+   ▼
+[model.py]  ─────────────────────────────────────── Camada Gold
+   │  Constrói o modelo dimensional (Star Schema)
+   │  Saída: 6 tabelas no banco data/warehouse/cv_case.db
+   │
+   ▼
+[api.py]  ───────────────────────────────────────── Consumo
+      API REST para consulta dos dados modelados
+```
 
 ---
 
-## 💻 3. Instruções de Instalação e Configuração
+## Stack Tecnológica
 
-### Pré-requisitos
+| Ferramenta | Para que serve |
+|---|---|
+| **DuckDB** | Banco de dados analítico embutido — executa SQL direto em arquivos Parquet sem servidor |
+| **Pandas** | Manipulação de dados em Python |
+| **Pandera** | Validação de contratos de dados (tipos, ranges, nulos obrigatórios) |
+| **FastAPI** | Framework para construção da API REST |
+| **Parquet** | Formato de armazenamento colunar — compacto e rápido para leitura analítica |
+| **Tenacity** | Retry automático com backoff exponencial nas requisições ao S3 do ONS |
 
-* Python 3.10 ou superior instalado.
+---
 
-### 📦 1. Clonar o Repositório e Instalar Dependências
+## Decisões de Design
+
+### Modelo dimensional com dois fatos separados
+
+Os dados do ONS têm duas granularidades distintas: uma por SPE (aerogerador individual) e outra por conjunto/complexo. Misturá-las em uma única tabela fato causa um problema chamado **fan trap** — ao somar métricas de complexo sobre linhas de SPE, o resultado é multiplicado pelo número de SPEs, gerando valores incorretos silenciosamente.
+
+A solução foi separar em dois fatos com seus grãos naturais:
+
+- **`fato_geracao_spe`** — 1 linha = 1 SPE × 1 intervalo de 30 min  
+  Métricas: vento, geração estimada, geração verificada
+- **`fato_geracao_conjunto`** — 1 linha = 1 complexo × 1 intervalo de 30 min  
+  Métricas: geração total, limitação, disponibilidade, motivo da restrição
+
+### Três níveis de tratamento de dados
+
+Em vez de descartar qualquer dado com problema, o pipeline aplica o tratamento mais adequado para cada tipo de anomalia:
+
+| Tipo | O que é | O que acontece |
+|---|---|---|
+| **Quarentena** | Linha que falha na validação Pandera ou é duplicata com valores conflitantes | Gravada em `data/quarentena/rejeitados.parquet` com o motivo — nunca descartada silenciosamente |
+| **Soft Drop** | Valor fisicamente impossível numa coluna (ex: vento negativo ou > 40 m/s) | Só aquela célula vira `NULL`; o resto da linha é preservado |
+| **Flagging** | Regra de negócio violada (ex: `val_geracaolimitada > val_geracaoreferencia`) | Linha permanece; recebe `flg_alerta_limitada = 1` para auditoria |
+
+### Garantia de 47 ativos na dimensão
+
+A `dim_spe` é construída a partir do arquivo `spes_casa_dos_ventos.csv` como base, com um `LEFT JOIN` nos dados de telemetria. Isso garante que todos os 47 ativos cadastrados apareçam na dimensão — mesmo que uma SPE não tenha enviado dados no período.
+
+### `dim_restricao` como vocabulário fixo do ONS
+
+Os códigos de restrição (REL, CNF, ENE, PAR) e origens (LOC, SIS) são definidos pelo ONS e não mudam. A `dim_restricao` é uma tabela seed hardcoded com as 8 combinações, garantindo que todos os tipos apareçam no modelo independente de quais ocorreram no período coletado.
+
+---
+
+## Modelo Dimensional (Camada Gold)
+
+```
+                    dim_tempo
+                    PK: din_instante
+                         │
+          ┌──────────────┴──────────────┐
+          │                             │
+  fato_geracao_spe              fato_geracao_conjunto
+  PK: (spe, din_instante)       PK: (id_ons_conjunto, din_instante)
+  FK → dim_spe                  FK → dim_conjunto
+  FK → dim_tempo                FK → dim_tempo
+                                FK → dim_restricao
+          │
+          ▼
+       dim_spe                  dim_conjunto
+       PK: spe          ──────► PK: id_ons_conjunto
+       FK → dim_conjunto         nom_conjunto, subsistema, estado
+
+                                dim_restricao
+                                PK: (cod_razaorestricao, cod_origemrestricao)
+                                8 linhas fixas do dicionário ONS
+```
+
+---
+
+## Instalação
+
+**Pré-requisito:** Python 3.10 ou superior.
 
 ```bash
 # Clone o repositório
-git clone [https://github.com/seu-usuario/case_analytics_data_eng.git](https://github.com/seu-usuario/case_analytics_data_eng.git)
+git clone https://github.com/seu-usuario/case_analytics_data_eng.git
 cd case_analytics_data_eng
 
-# Crie e ative o ambiente virtual (Recomendado)
+# Crie e ative o ambiente virtual
 python -m venv venv
-source venv/bin/activate  # No Windows use: venv\Scripts\activate
+source venv/bin/activate        # Linux/Mac
+# venv\Scripts\activate         # Windows
 
-# Instale os pacotes necessários
-pip install pandas pandera duckdb pyarrow fastapi uvicorn
-
+# Instale as dependências
+pip install -r requirements.txt
 ```
 
 ---
 
-## ⚡ 4. Sequência de Execução do Pipeline
+## Como executar
 
-O ecossistema foi modularizado para garantir total separação de escopos. Execute os comandos sempre a partir da **raiz do projeto**:
+Execute os comandos sempre a partir da **raiz do projeto**, na ordem abaixo:
 
-### Passo 1: Extração dos Dados Brutos (`Bronze`)
-
-Copia e consolida os arquivos brutos fornecidos para as tabelas iniciais do banco de dados analítico.
+### 1. Extração — baixa os dados do ONS
 
 ```bash
 python src/extract.py
-
 ```
 
-### Passo 2: Transformação, Limpeza e Auditoria de Qualidade (`Silver`)
+Baixa os arquivos Parquet do S3 do ONS para os últimos 6 meses completos.  
+Inclui fallback para `.csv` e `.xlsx` se o Parquet não estiver disponível.  
+Saída: `data/raw/raw_usinas/` e `data/raw/raw_usinas_detail/`
 
-Aplica os cruzamentos lógicos baseados na regex de código CEG, valida os contratos de dados via Pandera, aplica as regras de Soft Drop/Flagging e gera o relatório consolidado de saúde da base (`relatorio_qualidade.json`) com testes de *Freshness*, *Completude* e *Gaps*.
+### 2. Transformação e qualidade — limpa e valida os dados
 
 ```bash
 python src/load_transform.py
-
 ```
 
-### Passo 3: Modelagem Dimensional Gold (`Star Schema`)
+Une os dois datasets, aplica validações Pandera, executa as regras de qualidade e gera o relatório.  
+Saída: `data/modeled/fato_geracao_cv_tratado.parquet` e `relatorio_qualidade.json`
 
-Lê a base estruturada e quebra as informações no formato de estrela analítica, gerando as tabelas e arquivos parquets indexados de alta performance. Exibe no terminal o dicionário de dados e uma amostragem física de validação da `dim_ativo_eolico`.
+> Verifique o `relatorio_qualidade.json` após essa etapa. Ele mostra completude por projeto, distribuição de nulos, gaps de timestamp e registros em quarentena.
+
+### 3. Modelagem — constrói o Star Schema
 
 ```bash
 python src/model.py
-
 ```
+
+Lê o Silver e constrói as 6 tabelas do modelo dimensional no banco DuckDB.  
+Saída: `data/warehouse/cv_case.db` + arquivos Parquet em `data/modeled/`
+
+| Tabela | Linhas | Descrição |
+|---|---|---|
+| `dim_spe` | 47 | Cadastro de SPEs (aerogeradores) |
+| `dim_conjunto` | 7 | Cadastro de complexos eólicos |
+| `dim_restricao` | 8 | Tipos de restrição do ONS (seed estática) |
+| `dim_tempo` | 8.736 | Calendário de intervalos de 30 min |
+| `fato_geracao_spe` | 395.088 | Métricas físicas por SPE |
+| `fato_geracao_conjunto` | 61.152 | Métricas elétricas por complexo |
+
+### 4. API — sobe o servidor de consulta
+
+```bash
+uvicorn src.api:app --reload
+```
+
+Acesse a documentação interativa em: **`http://127.0.0.1:8000/docs`**
 
 ---
 
-## 🔍 5. Scripts de Diagnóstico e Auditoria Extra
+## API REST — Endpoints
 
-O repositório conta com scripts utilitários focados em checagens rápidas de consistência e depuração de dados diretamente no banco DuckDB:
+Todos os endpoints leem diretamente do banco Gold (`data/warehouse/cv_case.db`).
 
-* **`src/check_data.py`**: Realiza queries gerais de validação volumétrica e integridade nas tabelas do Data Warehouse.
-* **`src/check_data_spe.py`**: Focado na auditoria individualizada por SPE para garantir consistência temporal.
-* **`src/debug_raf11.py`**: Script de rastreabilidade cirúrgica desenvolvido para diagnosticar o fluxo do ativo RAF11 por todas as camadas do pipeline (Raw -> Intermediate -> Gold), identificando possíveis gargalos de mapeamento de strings ou descartes.
+### `GET /projects`
+Lista os 7 projetos com nome do conjunto, estado, subsistema e quantidade de SPEs.
 
-Para rodar qualquer um deles, execute da raiz:
+### `GET /generation/{project_id}`
+Geração verificada e estimada de um projeto agregada por dia ou mês.
+
+| Parâmetro | Valores | Descrição |
+|---|---|---|
+| `project_id` | FLS, RVD, BBS, RVE, UMR, BBC, TGR | Código do projeto |
+| `agrupamento` | `diario` (padrão) ou `mensal` | Granularidade temporal |
+| `data_inicio` | AAAA-MM-DD | Filtro de data inicial (opcional) |
+| `data_fim` | AAAA-MM-DD | Filtro de data final (opcional) |
+
+### `GET /restrictions/summary`
+Resumo de restrições por tipo: horas restritas e MWh cortado por projeto e motivo.
+
+> `total_mwh_cortado` positivo = corte real de energia. Negativo = restrição registrada pelo ONS mas sem impacto efetivo na geração (o teto autorizado estava acima da capacidade de referência).
+
+### `GET /health`
+Verifica se o banco Gold está disponível e retorna a contagem de linhas em cada tabela.
+
+---
+
+## Scripts de diagnóstico
+
+| Script | O que faz |
+|---|---|
+| `src/check_data.py` | Validações gerais de volume e integridade no banco |
+| `src/check_data_spe.py` | Auditoria por SPE individual |
+| `src/debug_raf11.py` | Rastreia o ativo RAF11 por todas as camadas do pipeline para identificar por que ele não tem dados |
 
 ```bash
 python src/debug_raf11.py
-
 ```
 
 ---
 
-## 🌐 6. Inicialização e Consumo da API REST
-
-Para expor os dados limpos e modelados do Star Schema para o consumo de outras aplicações ou portais corporativos, execute o servidor da API a partir da **raiz do projeto**:
-
-```bash
-uvicorn api:app --reload --app-dir src
+## Estrutura do repositório
 
 ```
-
-> 💡 **Nota de Execução:** O parâmetro `--app-dir src` garante que a raiz do projeto permaneça como o diretório ativo de trabalho, salvaguardando a integridade dos caminhos relativos das pastas `data/`.
-
-Após a inicialização do servidor, a documentação interativa Swagger poderá ser acessada diretamente pelo navegador através do endereço: **`http://127.0.0.1:8000/docs`**.
-
----
-
-### 📂 Estrutura do Repositório
-
-```text
 case_analytics_data_eng/
 ├── data/
-│   ├── raw/                 # Dados brutos obtidos da extração
-│   ├── warehouse/           # Data Warehouse embarcado (.db do DuckDB)
-│   └── modeled/             # Camada GOLD (Arquivos Parquet do Star Schema)
+│   ├── raw/
+│   │   ├── raw_usinas/          # Dataset 1: métricas de conjuntos (Bronze)
+│   │   └── raw_usinas_detail/   # Dataset 2: métricas de SPEs (Bronze)
+│   ├── modeled/                 # Parquets Silver + Gold
+│   ├── warehouse/
+│   │   └── cv_case.db           # Banco DuckDB com o modelo dimensional
+│   └── quarentena/
+│       └── rejeitados.parquet   # Registros rejeitados com motivo
 ├── src/
-│   ├── extract.py           # Pipeline de Ingestão Raw
-│   ├── load_transform.py    # Tratamento Pandera, Qualidade e Logs
-│   ├── model.py             # Fatiamento Dimensional e Governança de Chaves
-│   ├── api.py               # Servidor FastAPI de exposição dos dados
-│   ├── check_data.py        # Script utilitário de validação geral do DW
-│   ├── check_data_spe.py    # Script utilitário de validação por SPE
-│   └── debug_raf11.py       # Script de depuração e rastreabilidade do ativo RAF11
-[cite_start]├── spes_casa_dos_ventos.csv # Mapeamento mestre de sementes (47 ativos) [cite: 1]
-├── relatorio_qualidade.json # Dicionário consolidado de anomalias e erros
-└── README.md                # Este documento de documentação geral
-
+│   ├── extract.py               # Extração dos dados do ONS (S3)
+│   ├── load_transform.py        # Transformação, qualidade e validação
+│   ├── model.py                 # Modelagem dimensional (Star Schema)
+│   ├── api.py                   # API REST (FastAPI)
+│   ├── check_data.py            # Diagnóstico geral do banco
+│   ├── check_data_spe.py        # Diagnóstico por SPE
+│   └── debug_raf11.py           # Rastreabilidade do ativo RAF11
+├── spes_casa_dos_ventos.csv     # Cadastro mestre dos 47 ativos
+├── relatorio_qualidade.json     # Relatório gerado pelo load_transform.py
+├── requirements.txt
+└── README.md
 ```
 
-```
+---
 
-Só copiar e colar, Lívia! Vai ficar perfeito na sua entrega. Se precisar de mais alguma última checagem antes de enviar, manda bala! 🏁🍃
+## Limitações conhecidas da fonte de dados
 
-```
+**Join SPE → Conjunto feito por nome:** O dataset de conjuntos do ONS não tem CEG — o campo aparece como `"-"` para todos os complexos. O único caminho de join disponível é pelo nome da usina (`nom_usina`), em comparação case-insensitive. Essa é uma limitação dos dados abertos do ONS, não do pipeline.
+
+**Unidade de vento no dicionário ONS:** O campo `val_ventoverificado` está descrito como `m³/s` no dicionário oficial — o correto é `m/s`. A validação do pipeline usa o intervalo físico correto de 0 a 40 m/s.
