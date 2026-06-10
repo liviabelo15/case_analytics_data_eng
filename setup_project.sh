@@ -1,86 +1,128 @@
 #!/bin/bash
+# =============================================================================
+# setup_project.sh — Configuração e execução do pipeline Casa dos Ventos
+#
+# O que este script faz:
+#   1. Clona o repositório (se necessário)
+#   2. Cria o ambiente virtual e instala as dependências
+#   3. Executa o pipeline completo: extract → load_transform → model
+#   4. Exibe as instruções para iniciar a API
+#
+# Uso:
+#   bash setup_project.sh
+# =============================================================================
 
-set -e
-# =====================================================================
-# CONFIGURAÇÃO: Altere a URL abaixo para o repositório que deseja usar
-# =====================================================================
+set -e  # Para na primeira falha
+
 REPO_URL="https://github.com/liviabelo15/case_analytics_data_eng.git"
-
-# Extrai o nome da pasta a partir da URL do Git
 REPO_NAME=$(basename "$REPO_URL" .git)
 
-echo "Iniciando automação de configuração do projeto Python..."
+# --- Cores para output ---
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+BLUE='\033[0;34m'
+NC='\033[0m' # sem cor
 
-# 1. Verifica se o Git está instalado
+log_step()  { echo -e "\n${BLUE}▶ $1${NC}"; }
+log_ok()    { echo -e "${GREEN}✔ $1${NC}"; }
+log_warn()  { echo -e "${YELLOW}⚠ $1${NC}"; }
+log_error() { echo -e "${RED}✘ $1${NC}"; }
+
+# =============================================================================
+# 1. Verificações de dependências
+# =============================================================================
+log_step "Verificando dependências do sistema..."
+
 if ! command -v git &> /dev/null; then
-    echo "❌ Erro: O Git não está instalado ou não foi encontrado no PATH."
+    log_error "Git não encontrado. Instale em: https://git-scm.com"
     exit 1
 fi
 
-# 2. Verifica se o Python 3 está instalado
 if ! command -v python3 &> /dev/null; then
-    echo "❌ Erro: O Python 3 não está instalado ou não foi encontrado no PATH."
+    log_error "Python 3 não encontrado. Instale em: https://python.org"
     exit 1
 fi
 
-# 3. Clona o repositório do GitHub (se a pasta já não existir)
-if [ ! -d "$REPO_NAME" ]; then
-    echo "Clonando o repositório: $REPO_URL..."
+PYTHON_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+log_ok "Git $(git --version | cut -d' ' -f3) e Python $PYTHON_VERSION encontrados."
+
+# =============================================================================
+# 2. Clone do repositório
+# =============================================================================
+log_step "Configurando o repositório..."
+
+# Verifica se o script está sendo rodado de DENTRO do próprio repositório
+if [ -f "src/extract.py" ] && [ -f "requirements.txt" ]; then
+    log_ok "Repositório já presente. Usando o diretório atual."
+    PROJECT_DIR="."
+elif [ -d "$REPO_NAME" ]; then
+    log_warn "Pasta '$REPO_NAME' já existe. Usando a existente."
+    PROJECT_DIR="$REPO_NAME"
+else
+    log_step "Clonando $REPO_URL..."
     git clone "$REPO_URL"
-    cd "$REPO_NAME"
-else
-    echo "A pasta '$REPO_NAME' já existe. Acessando o diretório existente..."
-    cd "$REPO_NAME"
+    PROJECT_DIR="$REPO_NAME"
 fi
 
-# 4. Cria o Ambiente Virtual (venv)
-echo "Criando o ambiente virtual local (pasta 'venv')..."
-python3 -m venv venv
+cd "$PROJECT_DIR"
 
-# 5. Ativa o Ambiente Virtual
-echo "Ativando o ambiente virtual..."
-source venv/bin/activate
+# =============================================================================
+# 3. Ambiente virtual
+# =============================================================================
+log_step "Criando ambiente virtual..."
 
-# 6. Atualiza o gerenciador de pacotes (pip)
-echo "Atualizando o pip..."
-pip install --upgrade pip
-
-# 7. Instala as dependências listadas no requirements.txt
-if [ -f "requirements.txt" ]; then
-    echo "📥 Instalando bibliotecas do requirements.txt..."
-    pip install -r requirements.txt
-    echo "✨ Todas as bibliotecas foram instaladas perfeitamente!"
+if [ ! -d "venv" ]; then
+    python3 -m venv venv
+    log_ok "Ambiente virtual criado em ./venv"
 else
-    echo "⚠️ Aviso: O arquivo 'requirements.txt' não foi encontrado na raiz do projeto."
+    log_ok "Ambiente virtual já existe. Reutilizando."
 fi
 
-echo "--------------------------------------------------------"
-echo "🎉 Tudo pronto! O ambiente de desenvolvimento está configurado."
-echo "👉 Para começar, a rodar os códigos Python, usaremos os comandos:"
-echo "   cd $REPO_NAME"
-echo "   source venv/bin/activate"
-echo "--------------------------------------------------------"
+PYTHON="venv/bin/python3"
+PIP="venv/bin/pip"
 
-cd $REPO_NAME
-source venv/bin/activate
+log_step "Instalando dependências..."
+$PIP install --upgrade pip --quiet
+$PIP install -r requirements.txt --quiet
+log_ok "Dependências instaladas com sucesso."
 
-echo "--------------------------------------------------------"
-echo "Iniciando primeira etapa da Pipeline ELT: Extract"
-echo "Arquivo: extract.py"
-echo "--------------------------------------------------------"
+# =============================================================================
+# 4. Pipeline ELT
+# =============================================================================
+echo ""
+echo "============================================================"
+echo "  EXECUTANDO PIPELINE"
+echo "============================================================"
 
-#python extract.py
+# Etapa 1: Extração
+log_step "[1/3] Extração — baixando dados do ONS (S3)..."
+$PYTHON src/extract.py
+log_ok "Extração concluída. Arquivos salvos em data/raw/"
 
-echo "--------------------------------------------------------"
-echo "Iniciando segunda e terceira etapa da Pipeline ELT: Load and Transform"
-echo "Arquivo: load_transform.py"
-echo "--------------------------------------------------------"
+# Etapa 2: Transformação e Qualidade
+log_step "[2/3] Transformação e Qualidade — validando e unindo datasets..."
+$PYTHON src/load_transform.py
+log_ok "Transformação concluída. Silver layer em data/modeled/"
+log_ok "Relatório de qualidade gerado: relatorio_qualidade.json"
 
-#python load_transform.py
+# Etapa 3: Modelagem Dimensional
+log_step "[3/3] Modelagem Dimensional — construindo Star Schema Gold..."
+$PYTHON src/model.py
+log_ok "Modelagem concluída. Banco em data/warehouse/cv_case.db"
 
-echo "--------------------------------------------------------"
-echo "Iniciando construção de API"
-echo "Arquivo: api.py"
-echo "--------------------------------------------------------"
-
-#python api.py
+# =============================================================================
+# 5. Instruções finais
+# =============================================================================
+echo ""
+echo "============================================================"
+echo -e "${GREEN}  PIPELINE CONCLUÍDO COM SUCESSO${NC}"
+echo "============================================================"
+echo ""
+echo "Para iniciar a API REST, execute:"
+echo ""
+echo -e "  ${YELLOW}source venv/bin/activate${NC}"
+echo -e "  ${YELLOW}uvicorn src.api:app --reload${NC}"
+echo ""
+echo "  Acesse a documentação interativa em: http://127.0.0.1:8000/docs"
+echo ""
