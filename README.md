@@ -18,28 +18,57 @@ Este pipeline baixa esses arquivos automaticamente, une os dois datasets, valida
 
 O pipeline segue o padrão **ELT** (Extract → Load → Transform): os dados são carregados primeiro no DuckDB e as transformações são feitas em SQL dentro do banco, aproveitando o motor analítico colunar para joins e agregações eficientes.
 
+```mermaid
+flowchart TD
+    ons["Dados Abertos ONS (S3)<br/>2 datasets: conjunto + SPE"]
+    spescdv["Dados SPES Casa dos Ventos<br/>1 dataset: SPE + projeto"]
+    extract["extract.py — Extract<br/>retry + fallback parquet/csv/xlsx"]
+
+    subgraph lt["load_transform.py — Load + Transform"]
+        direction TB
+        load["Load → DuckDB<br/>raw + seed CSV"]
+        transform["Transform (SQL)<br/>filtro CEG · join SPE↔conjunto · soft drops"]
+        qual["Qualidade (Pandera)<br/>dedup · quarentena · completude"]
+        load --> transform --> qual
+    end
+
+    quar["Quarentena<br/>rejeitados.parquet"]
+    relat["Relatório de qualidade<br/>relatorio_qualidade.json"]
+    model["model.py — Star schema<br/>2 fatos + 4 dimensões (Gold)"]
+    api["api.py — FastAPI<br/>lê tabelas Gold via SQL"]
+
+    ons --> extract
+    extract -->|"Bronze / Raw"| load
+    spescdv -->|"seed CSV"| load
+    qual --> quar
+    qual --> relat
+    lt -->|"Silver .parquet"| model
+    model -->|"Gold · DuckDB"| api
+
+    classDef gray fill:#f5f5f5,stroke:#666666,color:#333333
+    classDef purple fill:#e1d5e7,stroke:#9673a6,color:#333333
+    classDef teal fill:#b0e3e6,stroke:#0e8088,color:#333333
+    classDef amber fill:#ffe6cc,stroke:#d79b00,color:#333333
+    classDef green fill:#d5e8d4,stroke:#82b366,color:#333333
+    classDef blue fill:#dae8fc,stroke:#6c8ebf,color:#333333
+
+    class ons gray
+    class spescdv green
+    class extract purple
+    class load,transform teal
+    class qual,quar,relat amber
+    class model green
+    class api blue
+
+    style lt fill:#f3edf7,stroke:#9673a6
 ```
-ONS (S3)
-   │
-   ▼
-[extract.py]  ──────────────────────────────────── Camada Bronze (Extract)
-   │  Baixa os arquivos Parquet do ONS e salva em data/raw/
-   │
-   ▼
-[load_transform.py]  ────────────────────────────── Camada Silver (Load + Transform)
-   │  Carrega no DuckDB, une os dois datasets via SQL,
-   │  aplica regras de qualidade e valida com Pandera
-   │  Saída: data/modeled/fato_geracao_cv_tratado.parquet
-   │
-   ▼
-[model.py]  ─────────────────────────────────────── Camada Gold (Transform)
-   │  Constrói o modelo dimensional (Star Schema) em SQL
-   │  Saída: 6 tabelas no banco data/warehouse/cv_case.db
-   │
-   ▼
-[api.py]  ───────────────────────────────────────── Consumo
-      API REST para consulta dos dados modelados
-```
+
+| Script | Camada | Responsabilidade |
+|---|---|---|
+| `extract.py` | Bronze | Baixa os arquivos do S3 do ONS com retry, fallback de formato (.parquet → .csv → .xlsx) e download em streaming |
+| `load_transform.py` | Silver | Carrega os dados no DuckDB, une os dois datasets via SQL, aplica regras de qualidade (quarentena, soft drop, flagging) e valida com Pandera |
+| `model.py` | Gold | Constrói o Star Schema com dois fatos separados por granularidade (SPE e conjunto) para eliminar fan trap |
+| `api.py` | Consumo | Expõe os dados do modelo Gold via API REST (FastAPI), com endpoints de geração, restrições e saúde do banco |
 
 ---
 
