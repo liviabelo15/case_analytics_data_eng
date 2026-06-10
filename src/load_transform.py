@@ -28,10 +28,9 @@ RAW_USINAS_DETAIL_DIR = Path("data/raw/raw_usinas_detail")
 DB_PATH = Path("data/warehouse/cv_case.db")
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-# === CAMINHO PARA SALVAR O ARQUIVO PARQUET TRATADO ===
 GOLD_OUTPUT_DIR = Path("data/modeled")
 GOLD_PARQUET_PATH = GOLD_OUTPUT_DIR / "fato_geracao_cv_tratado.parquet"
-# ==========================================================
+QUARENTENA_PATH = Path("data/quarentena/rejeitados.parquet")
 
 def load_duckdb(db_path: Path, raw_usinas_path: Path, raw_detail_path: Path):
     logger.info("Iniciando a fase LOAD no DuckDB lendo arquivos Parquet...")
@@ -109,6 +108,14 @@ def filtrar_raw_usinas_conj(db_path: Path):
         con.sql(query)
         linhas_finais = con.sql("SELECT COUNT(*) FROM int_cv_conj").fetchone()
         logger.info(f"Filtro aplicado com sucesso! Total de registros mantidos: {linhas_finais}")
+
+        # nom_usina é nullable no Dataset 1 (dicionário ONS) — se NULL, o join por nome falha
+        nulos_nom = con.sql("SELECT COUNT(*) FROM int_cv_conj WHERE nom_usina IS NULL").fetchone()[0]
+        if nulos_nom > 0:
+            logger.warning(
+                f"{nulos_nom} registro(s) em int_cv_conj com nom_usina NULL. "
+                "Esses conjuntos não serão linkados a nenhuma SPE no join por nome."
+            )
     except Exception as e:
         logger.error(f"Erro ao filtrar a tabela: {e}")
         raise
@@ -156,11 +163,20 @@ def relacionar_spe_conjunto(db_path: Path):
                 -- ====================================================
                 -- REGRA: FLAGGING (Sinaliza Limitada > Referência)
                 -- ====================================================
-                CASE 
+                CASE
                     WHEN TRY_CAST(conj.val_geracaolimitada AS FLOAT) > COALESCE(TRY_CAST(conj.val_geracaoreferenciafinal AS FLOAT), TRY_CAST(conj.val_geracaoreferencia AS FLOAT)) THEN 1
-                    ELSE 0 
-                END AS flg_alerta_limitada
-                
+                    ELSE 0
+                END AS flg_alerta_limitada,
+
+                -- ====================================================
+                -- FLAG: val_geracaoestimada calculada por histórico
+                -- (quando flg=1, o ONS usa histórico em vez da curva vento×potência)
+                -- ====================================================
+                CASE
+                    WHEN TRY_CAST(spe.flg_dadoventoinvalido AS INTEGER) = 1 THEN 1
+                    ELSE 0
+                END AS flg_estimada_por_historico
+
             FROM int_usinas_cv AS spe
             LEFT JOIN int_cv_conj AS conj
                 ON UPPER(
@@ -193,7 +209,7 @@ schema = DataFrameSchema(
         "id_ons_conjunto": Column(nullable=False),
         "ceg": Column(nullable=False),
         "din_instante": Column(pa.DateTime, nullable=False),
-        "val_geracao_conjunto": Column(float, checks=Check.ge(0), nullable=True),
+        "val_geracao_conjunto": Column(float, checks=Check.ge(0), nullable=False),
         "val_ventoverificado": Column(float, checks=Check.in_range(0, 40), nullable=True),
         "flg_alerta_limitada": Column(int, checks=Check.isin([0, 1]), nullable=False),
         "val_geracaolimitada_conjunto": Column(float, checks=Check.ge(0), nullable=True),
@@ -208,216 +224,394 @@ schema = DataFrameSchema(
 
 def extrair_e_tratar_pandera(db_path: Path) -> pd.DataFrame:
     logger.info("Iniciando extração e tratamento via Pandera...")
-    
+
+    THRESHOLD_COMPLETUDE = 95.0
+
     with duckdb.connect(str(db_path)) as con:
         df = con.sql("SELECT * FROM fato_geracao_cv").df()
+        seed_df = con.sql("SELECT projeto, spe FROM seed_spes_cv").df()
 
     print(f"\n{'='*50}\n INICIANDO TRATAMENTO E RELATÓRIO DE QUALIDADE \n{'='*50}")
-    
+
     linhas_iniciais = len(df)
     arquivo_log_json = Path("relatorio_qualidade.json")
-    
-    # 1. Limpeza básica para o Pandera não quebrar
-    df = df.replace(r'^\s*$', np.nan, regex=True).replace(['null', 'NULL', 'NaN', 'nan', 'N/A', 'n/a', '-'], np.nan)
+
+    # Limpeza básica de tipos
+    df = df.replace(r'^\s*$', np.nan, regex=True).replace(
+        ['null', 'NULL', 'NaN', 'nan', 'N/A', 'n/a', '-'], np.nan
+    )
     df['din_instante'] = pd.to_datetime(df['din_instante'], errors='coerce')
-    
     cols_num = df.filter(regex='^val_|^flg_').columns
     df[cols_num] = df[cols_num].apply(pd.to_numeric, errors='coerce')
 
-    # Duplicatas (Hard Drop)
-    duplicatas_iniciais = df.duplicated(subset=['nome_spe_cv', 'din_instante']).sum()
-    df = df.drop_duplicates(subset=['nome_spe_cv', 'din_instante'])
-    df = df.reset_index(drop=True)
+    # Nulos por coluna ANTES do tratamento (para comparar com depois)
+    colunas_metricas = [
+        "val_ventoverificado", "val_geracaoestimada", "val_geracaoverificada",
+        "val_geracao_conjunto", "val_geracaolimitada_conjunto",
+        "val_geracaoreferencia_conjunto", "val_geracaoreferenciafinal_conjunto",
+        "val_disponibilidade_conjunto"
+    ]
+    nulos_antes = {
+        col: round(100 * df[col].isna().sum() / max(len(df), 1), 2)
+        for col in colunas_metricas if col in df.columns
+    }
 
-    # Lista mestra onde guardaremos todas as justificativas estruturadas
+    # =========================================================
+    # DUPLICATAS: separa idênticas (descartar) de conflitantes (quarentena)
+    # =========================================================
+    chave_dup = ['nome_spe_cv', 'din_instante']
+    lista_quarentena = []
     detalhe_anomalias = []
 
-    # 2. APLICAÇÃO DO CONTRATO (PANDERA) - DETECÇÃO DE HARD DROPS
+    mask_qualquer_dup = df.duplicated(subset=chave_dup, keep=False)
+    df_duplicados = df[mask_qualquer_dup]
+    mask_linha_inteira_dup = df_duplicados.duplicated(keep=False)
+    df_dup_conflitantes = df_duplicados[~mask_linha_inteira_dup].copy()
+
+    if not df_dup_conflitantes.empty:
+        df_dup_conflitantes["motivo_rejeicao"] = (
+            "Duplicata conflitante: mesma chave (spe, din_instante) com valores divergentes"
+        )
+        df_dup_conflitantes["etapa_rejeicao"] = "deduplicacao"
+        lista_quarentena.append(df_dup_conflitantes)
+        # Remove TODAS as ocorrências da chave conflitante do df principal
+        chaves_conf = df_dup_conflitantes[chave_dup].drop_duplicates()
+        df = df.merge(chaves_conf, on=chave_dup, how='left', indicator=True)
+        df = df[df['_merge'] == 'left_only'].drop(columns='_merge')
+        logger.warning(
+            f"{len(df_dup_conflitantes)} linha(s) com chave duplicada e valores divergentes "
+            "removidas e enviadas para quarentena."
+        )
+
+    n_identicas_removidas = int(df.duplicated(subset=chave_dup).sum())
+    df = df.drop_duplicates(subset=chave_dup).reset_index(drop=True)
+
+    # =========================================================
+    # VALIDAÇÃO PANDERA: quarentena em vez de hard drop silencioso
+    # =========================================================
     try:
         df_clean = schema.validate(df, lazy=True)
         indices_falhos = []
     except pa.errors.SchemaErrors as err:
         failure_df = err.failure_cases
-        indices_falhos = failure_df['index'].dropna().unique().astype(int)
-        
-        # Registra os descartes críticos (Hard Drops) no JSON
+        indices_falhos = list(failure_df['index'].dropna().unique().astype(int))
+
+        df_rejeitado = df.loc[df.index.isin(indices_falhos)].copy()
+        motivos_por_idx = (
+            failure_df.groupby("index")["check"]
+            .apply(lambda x: "; ".join(x.astype(str)))
+            .to_dict()
+        )
+        df_rejeitado["motivo_rejeicao"] = df_rejeitado.index.map(
+            lambda i: f"Pandera: {motivos_por_idx.get(i, 'violação de schema')}"
+        )
+        df_rejeitado["etapa_rejeicao"] = "pandera_schema"
+        lista_quarentena.append(df_rejeitado)
+
         for idx in indices_falhos:
             row_data = df.loc[idx]
             motivos = failure_df[failure_df['index'] == idx]
-            txt_motivos = [f"Coluna [{m['column']}] violou a regra [{m['check']}]" for _, m in motivos.iterrows()]
-            
-            timestamp = row_data.get('din_instante', 'N/A')
-            timestamp_str = timestamp.strftime('%d/%m/%Y %H:%M') if isinstance(timestamp, pd.Timestamp) else str(timestamp)
-            
+            txt_motivos = [
+                f"Coluna [{m['column']}] violou [{m['check']}]"
+                for _, m in motivos.iterrows()
+            ]
+            ts = row_data.get('din_instante', 'N/A')
+            ts_str = ts.strftime('%d/%m/%Y %H:%M') if isinstance(ts, pd.Timestamp) else str(ts)
             detalhe_anomalias.append({
                 "nome": str(row_data.get('nome_spe_cv', 'N/A')),
                 "estado": str(row_data.get('id_estado', 'N/A')),
                 "subsistema": str(row_data.get('nom_subsistema', 'N/A')),
-                "din_instante": timestamp_str,
-                "justificativa": "DESCARTE CRÍTICO (Linha removida): " + " | ".join(txt_motivos)
+                "din_instante": ts_str,
+                "justificativa": "QUARENTENA: " + " | ".join(txt_motivos)
             })
-            
-        df_clean = df.drop(index=indices_falhos)
 
-    # =====================================================================
-    # DETECÇÃO DE ANOMALIAS OPERACIONAIS (SOFT DROPS E FLAGS) PARA O JSON
-    # =====================================================================
-    # Filtramos de forma performática apenas as linhas que possuem algum evento atípico
+        df_clean = df.loc[~df.index.isin(indices_falhos)].copy()
+        logger.warning(f"{len(indices_falhos)} linha(s) enviadas para quarentena (schema Pandera).")
+
+    # Salva arquivo de quarentena (acumula todos os tipos de rejeição)
+    n_quarentena = 0
+    if lista_quarentena:
+        df_quarentena = pd.concat(lista_quarentena, ignore_index=True)
+        n_quarentena = len(df_quarentena)
+        QUARENTENA_PATH.parent.mkdir(parents=True, exist_ok=True)
+        df_quarentena.to_parquet(QUARENTENA_PATH, index=False, compression="snappy")
+        logger.info(f"Quarentena: {n_quarentena} registro(s) salvos em {QUARENTENA_PATH}")
+
+    # =========================================================
+    # SOFT DROPS E FLAGS (registra no JSON para auditoria)
+    # =========================================================
     df_anomalias_soft = df_clean[
-        (df_clean['val_ventoverificado'].isna()) | 
-        (df_clean['val_geracao_conjunto'].isna()) | 
+        (df_clean['val_ventoverificado'].isna()) |
+        (df_clean['val_geracao_conjunto'].isna()) |
         (df_clean['flg_alerta_limitada'] == 1)
     ]
-
     for _, row in df_anomalias_soft.iterrows():
-        justificativas_linha = []
+        motivos_soft = []
         if pd.isna(row['val_ventoverificado']):
-            justificativas_linha.append("Velocidade do vento inválida, negativa, superior a 40 m/s ou flag de falha de telemetria ativa (Dado Anulado)")
+            motivos_soft.append("Vento anulado (inválido, fora de 0–40 m/s ou flag de telemetria ativa)")
         if pd.isna(row['val_geracao_conjunto']):
-            justificativas_linha.append("Geração de energia com valor negativo reportada pelo ONS (Dado Anulado)")
+            motivos_soft.append("Geração do conjunto anulada (valor negativo)")
         if row['flg_alerta_limitada'] == 1:
-            justificativas_linha.append("Inconsistência Contábil: Geração limitada excede a geração de referência oficial (Sinalizado via Flag)")
-            
-        timestamp_str = row['din_instante'].strftime('%d/%m/%Y %H:%M') if isinstance(row['din_instante'], pd.Timestamp) else str(row['din_instante'])
-        
+            motivos_soft.append("Geração limitada excede a geração de referência")
+        ts_str = row['din_instante'].strftime('%d/%m/%Y %H:%M') if isinstance(row['din_instante'], pd.Timestamp) else str(row['din_instante'])
         detalhe_anomalias.append({
             "nome": str(row.get('nome_spe_cv', 'N/A')),
             "estado": str(row.get('id_estado', 'N/A')),
             "subsistema": str(row.get('nom_subsistema', 'N/A')),
-            "din_instante": timestamp_str,
-            "justificativa": "ANOMALIA: " + " ; ".join(justificativas_linha)
+            "din_instante": ts_str,
+            "justificativa": "SOFT DROP/FLAG: " + " ; ".join(motivos_soft)
         })
 
-    # Coleta de Métricas Globais para o Cabeçalho do JSON e do Terminal
-    qtd_vento_nulo = df_clean['val_ventoverificado'].isna().sum()
-    qtd_geracao_nula = df_clean['val_geracao_conjunto'].isna().sum()
-    qtd_alertas_limitada = (df_clean['flg_alerta_limitada'] == 1).sum()
-    registros_descartados = len(indices_falhos)
+    # =========================================================
+    # MÉTRICAS GLOBAIS
+    # =========================================================
+    qtd_vento_nulo    = int(df_clean['val_ventoverificado'].isna().sum())
+    qtd_geracao_nula  = int(df_clean['val_geracao_conjunto'].isna().sum())
+    qtd_alertas       = int((df_clean['flg_alerta_limitada'] == 1).sum())
+    qtd_flag_invalido = int((df_clean['flg_dadoventoinvalido'] == 1).sum())
+    qtd_flag_null     = int(df_clean['flg_dadoventoinvalido'].isna().sum())
+    qtd_flag_valido   = len(df_clean) - qtd_flag_invalido - qtd_flag_null
+    spes_com_dados    = int(df_clean['nome_spe_cv'].nunique()) if 'nome_spe_cv' in df_clean.columns else 0
+    spes_sem_conj     = int(df_clean['id_ons_conjunto'].isna().sum()) if 'id_ons_conjunto' in df_clean.columns else 0
 
-    # =====================================================================
-    # ESCRITA DO ARQUIVO JSON (Sempre sobrescrevendo com modo 'w')
-    # =====================================================================
+    # Regras de negócio contadas no df pré-pandera (o que existia antes do tratamento)
+    geracao_neg   = int((df['val_geracao_conjunto'].dropna() < 0).sum()) if 'val_geracao_conjunto' in df.columns else 0
+    vento_fora    = int(((df['val_ventoverificado'] < 0) | (df['val_ventoverificado'] > 40)).sum()) if 'val_ventoverificado' in df.columns else 0
+    vento_flag_b  = int((df['flg_dadoventoinvalido'] == 1).sum()) if 'flg_dadoventoinvalido' in df.columns else 0
+
+    # Nulos por coluna DEPOIS do tratamento
+    nulos_depois = {
+        col: round(100 * df_clean[col].isna().sum() / max(len(df_clean), 1), 2)
+        for col in colunas_metricas if col in df_clean.columns
+    }
+    nulos_por_coluna = {
+        col: {"antes_pct": nulos_antes.get(col, 0), "depois_pct": nulos_depois.get(col, 0)}
+        for col in colunas_metricas if col in df_clean.columns
+    }
+
+    # Distribuições numéricas (min/p25/p50/p75/max/media)
+    distribuicoes = {}
+    for col in colunas_metricas:
+        if col in df_clean.columns and df_clean[col].notna().any():
+            s = df_clean[col].dropna()
+            distribuicoes[col] = {
+                "min":   round(float(s.min()), 4),
+                "p25":   round(float(s.quantile(0.25)), 4),
+                "p50":   round(float(s.median()), 4),
+                "p75":   round(float(s.quantile(0.75)), 4),
+                "max":   round(float(s.max()), 4),
+                "media": round(float(s.mean()), 4)
+            }
+
+    # =========================================================
+    # COMPLETUDE POR PROJETO
+    # Denominador FIXO: período esperado da coleta (não derivado dos dados).
+    # Usar o range observado como denominador sempre dá ~100% — é como medir
+    # sua própria altura contra você mesmo. O denominador certo é o período
+    # contratado (out/2025–mar/2026), independente do que chegou.
+    # =========================================================
+    completude_proj = {}
+    if 'din_instante' in df_clean.columns and 'projeto_cv' in df_clean.columns and not df_clean.empty:
+        # Período fixo da coleta: usa o primeiro e último dia dos dados reais
+        # mas impõe limites ao nível de mês, não de timestamp observado
+        min_ts_obs = df_clean['din_instante'].min()
+        max_ts_obs = df_clean['din_instante'].max()
+
+        # Denominador: início do primeiro mês até fim do último mês (dias completos)
+        inicio_periodo = min_ts_obs.replace(day=1, hour=0, minute=0, second=0)
+        # Último dia do mês de max_ts
+        import calendar
+        ultimo_dia = calendar.monthrange(max_ts_obs.year, max_ts_obs.month)[1]
+        fim_periodo = max_ts_obs.replace(day=ultimo_dia, hour=23, minute=30, second=0)
+        n_periodos_fixo = len(pd.date_range(start=inicio_periodo, end=fim_periodo, freq="30min"))
+
+        spes_por_projeto = seed_df.groupby('projeto')['spe'].count().to_dict()
+        spes_lista = seed_df.groupby('projeto')['spe'].apply(list).to_dict()
+
+        for projeto, n_spes in spes_por_projeto.items():
+            esperado = n_spes * n_periodos_fixo
+
+            # Conta timestamps DISTINTOS por SPE (não soma de linhas do projeto)
+            df_proj = df_clean[df_clean['projeto_cv'] == projeto]
+            recebido_por_spe = (
+                df_proj.groupby('nome_spe_cv')['din_instante']
+                .nunique()
+            )
+            recebido = int(recebido_por_spe.sum())
+
+            # SPEs que estão no seed mas sem nenhum dado recebido
+            spes_sem_dado = [
+                s for s in spes_lista.get(projeto, [])
+                if s not in recebido_por_spe.index
+            ]
+
+            pct_envio = round(100 * recebido / esperado, 1) if esperado > 0 else 0.0
+
+            # Completude de dados válidos: timestamps com val_geracao_conjunto não-nulo
+            recebido_valido = int(
+                df_proj.dropna(subset=['val_geracao_conjunto'])
+                .groupby('nome_spe_cv')['din_instante']
+                .nunique()
+                .sum()
+            )
+            pct_valido = round(100 * recebido_valido / esperado, 1) if esperado > 0 else 0.0
+
+            # Gaps e completude POR SPE individual
+            gaps_total = 0
+            detalhe_por_spe = {}
+            for spe_nome, grupo_spe in df_proj.groupby('nome_spe_cv'):
+                grupo_ord = grupo_spe.sort_values('din_instante')
+                gaps_spe = int((grupo_ord['din_instante'].diff() > pd.Timedelta(minutes=45)).sum())
+                gaps_total += gaps_spe
+                rec_spe = int(grupo_ord['din_instante'].nunique())
+                pct_spe = round(100 * rec_spe / n_periodos_fixo, 1)
+                # Inclui no detalhe apenas SPEs com completude < 100% ou gaps
+                if pct_spe < 100.0 or gaps_spe > 0:
+                    detalhe_por_spe[spe_nome] = {
+                        "recebido": rec_spe,
+                        "esperado": n_periodos_fixo,
+                        "pct": pct_spe,
+                        "gaps": gaps_spe
+                    }
+
+            completude_proj[projeto] = {
+                "spes_esperadas": int(n_spes),
+                "spes_sem_dado": spes_sem_dado,
+                "n_periodos_fixo_por_spe": n_periodos_fixo,
+                "esperado_total": esperado,
+                "recebido_total": recebido,
+                "pct_envio": pct_envio,
+                "recebido_valido": recebido_valido,
+                "pct_dados_validos": pct_valido,
+                "gaps_detectados": gaps_total,
+                "alerta": pct_envio < THRESHOLD_COMPLETUDE or pct_valido < THRESHOLD_COMPLETUDE,
+                "spes_com_problema": detalhe_por_spe  # vazio se todas 100%
+            }
+
+    # =========================================================
+    # FRESHNESS CHECK
+    # =========================================================
+    freshness_info = {"status": "FALHA", "ok": False, "ultimo_mes_esperado": "N/A", "mensagem": "Sem dados"}
+    if 'din_instante' in df_clean.columns and not df_clean.empty:
+        max_ts_f = df_clean['din_instante'].max()
+        agora = pd.Timestamp.now()
+        mes_esp = 12 if agora.month == 1 else agora.month - 1
+        ano_esp = agora.year - 1 if agora.month == 1 else agora.year
+        freshness_info["ultimo_mes_esperado"] = f"{mes_esp:02d}/{ano_esp}"
+        if max_ts_f.year == ano_esp and max_ts_f.month == mes_esp:
+            freshness_info.update({"status": "OK", "ok": True,
+                "mensagem": f"Último registro: {max_ts_f.strftime('%d/%m/%Y %H:%M')}"})
+        elif (max_ts_f.year > ano_esp) or (max_ts_f.year == ano_esp and max_ts_f.month > mes_esp):
+            freshness_info.update({"status": "ALERTA",
+                "mensagem": f"Base contém dados do mês atual ({max_ts_f.strftime('%m/%Y')})"})
+        else:
+            freshness_info.update({"status": "FALHA",
+                "mensagem": f"Dados desatualizados. Último: {max_ts_f.strftime('%d/%m/%Y %H:%M')}"})
+
+    # =========================================================
+    # JSON EXPANDIDO
+    # =========================================================
+    periodo = {
+        "inicio": df_clean['din_instante'].min().strftime('%Y-%m-%d') if not df_clean.empty else "N/A",
+        "fim":    df_clean['din_instante'].max().strftime('%Y-%m-%d') if not df_clean.empty else "N/A"
+    }
     relatorio_final_json = {
         "data_processamento": pd.Timestamp.now().strftime('%d/%m/%Y %H:%M:%S'),
-        "resumo_executivo": {
-            "total_registros_brutos": linhas_iniciais,
-            "duplicatas_removidas": int(duplicatas_iniciais),
-            "descartes_totais_hard_drop": int(registros_descartados),
-            "vento_anulado_soft_drop": int(qtd_vento_nulo),
-            "geracao_anulada_soft_drop": int(qtd_geracao_nula),
-            "alertas_limitada_flag": int(qtd_alertas_limitada)
+        "periodo_dados": periodo,
+        "volumetria": {
+            "total_registros_brutos":                  linhas_iniciais,
+            "duplicatas_identicas_removidas":          n_identicas_removidas,
+            "duplicatas_conflitantes_para_quarentena": len(df_dup_conflitantes) if not df_dup_conflitantes.empty else 0,
+            "hard_drops_pandera":                      len(indices_falhos),
+            "total_em_quarentena":                     n_quarentena,
+            "registros_limpos":                        len(df_clean),
+            "vento_anulado_soft_drop":                 qtd_vento_nulo,
+            "geracao_conj_anulada_soft_drop":          qtd_geracao_nula,
+            "alertas_limitada_flag":                   qtd_alertas
+        },
+        "integridade_referencial": {
+            "spes_esperadas": 47,
+            "spes_com_dados": spes_com_dados,
+            "registros_sem_conjunto_apos_join": spes_sem_conj
+        },
+        "estados_vento": {
+            "valido_flag_0":                             qtd_flag_valido,
+            "invalido_flag_1_estimativa_por_historico":  qtd_flag_invalido,
+            "sem_dado_flag_null":                        qtd_flag_null
+        },
+        "regras_negocio": {
+            "geracao_negativa_bruta":     {"falhas": geracao_neg,    "acao": "campo_nullificado"},
+            "vento_fora_faixa_0_40ms":    {"falhas": vento_fora,     "acao": "campo_nullificado"},
+            "vento_flag_invalido":         {"falhas": vento_flag_b,   "acao": "campo_nullificado_flg_historico=1"},
+            "limitada_maior_referencia":   {"falhas": qtd_alertas,    "acao": "flg_alerta_limitada=1"},
+            "geracao_conj_nula_pos_join":  {"falhas": qtd_geracao_nula, "acao": "alerta_join_incompleto"}
+        },
+        "nulos_por_coluna":       nulos_por_coluna,
+        "distribuicao_numerica":  distribuicoes,
+        "completude_por_projeto": completude_proj,
+        "freshness":              freshness_info,
+        "quarentena": {
+            "total":   n_quarentena,
+            "arquivo": str(QUARENTENA_PATH) if n_quarentena > 0 else None
         },
         "anomalias_detectadas": detalhe_anomalias
     }
 
     with open(arquivo_log_json, "w", encoding="utf-8") as f:
         json.dump(relatorio_final_json, f, indent=4, ensure_ascii=False)
-    print(f"ℹ️ Sucesso! Arquivo '{arquivo_log_json}' atualizado com as justificativas estruturadas.")
+    logger.info(f"Relatório de qualidade salvo em '{arquivo_log_json}'.")
 
-    # =====================================================================
-    # NOVA ANÁLISE 1: COMPLETUDE (Envio ONS vs Dados Úteis)
-    # =====================================================================
-    completude_relatorio = []
-    THRESHOLD_COMPLETUDE = 95.0 
-    
-    if 'din_instante' in df_clean.columns and 'nome_spe_cv' in df_clean.columns:
-        for spe, grupo in df_clean.groupby('nome_spe_cv'):
-            min_data = grupo['din_instante'].min()
-            max_data = grupo['din_instante'].max()
-            
-            if pd.notna(min_data) and pd.notna(max_data):
-                range_esperado = pd.date_range(start=min_data, end=max_data, freq='30min')
-                total_esperado = len(range_esperado)
-                
-                total_recebido = grupo['din_instante'].nunique()
-                
-                # Consideramos dados úteis apenas se vento E geração não forem nulos
-                grupo_valido = grupo.dropna(subset=['val_geracao_conjunto', 'val_ventoverificado'])
-                total_uteis = grupo_valido['din_instante'].nunique()
-                
-                perc_envio = (total_recebido / total_esperado * 100) if total_esperado > 0 else 0
-                perc_uteis = (total_uteis / total_esperado * 100) if total_esperado > 0 else 0
-                
-                status = "🟢 OK" if perc_uteis >= THRESHOLD_COMPLETUDE else "🔴 ALERTA DE QUALIDADE"
-                completude_relatorio.append(
-                    f" - {spe}: Envio ONS: {perc_envio:.1f}% | Dados Úteis: {perc_uteis:.1f}% ({total_uteis}/{total_esperado}) {status}"
-                )
-
-    # =====================================================================
-    # NOVA ANÁLISE 2: FRESHNESS CHECK
-    # =====================================================================
-    freshness_status = "🔴 FALHA: Sem dados do último mês completo na base."
-    if 'din_instante' in df_clean.columns and not df_clean.empty:
-        max_timestamp = df_clean['din_instante'].max()
-        data_atual = pd.Timestamp.now()
-        mes_esperado = 12 if data_atual.month == 1 else data_atual.month - 1
-        ano_esperado = data_atual.year - 1 if data_atual.month == 1 else data_atual.year
-            
-        if max_timestamp.year == ano_esperado and max_timestamp.month == mes_esperado:
-            freshness_status = f"🟢 SUCESSO: Dados validados com o último mês fechado! Último registro em: {max_timestamp.strftime('%d/%m/%Y %H:%M')}"
-        elif (max_timestamp.year > ano_esperado) or (max_timestamp.year == ano_esperado and max_timestamp.month > mes_esperado):
-            freshness_status = f"⚠️ ALERTA: A base contém dados do mês atual ({max_timestamp.strftime('%m/%Y')}), mas o critério de fechamento esperava apenas o mês anterior completo ({mes_esperado:02d}/{ano_esperado})."
-        else:
-            freshness_status = f"🔴 FALHA: Dados desatualizados ou incompletos. Último registro em: {max_timestamp.strftime('%d/%m/%Y %H:%M')} (Esperado safra fechada: {mes_esperado:02d}/{ano_esperado})"
-
-    # =====================================================================
-    # 3. ANÁLISE DE CONTINUIDADE (GAPS OPERACIONAIS REAIS)
-    # =====================================================================
-    gaps_relatorio = []
-    if 'din_instante' in df_clean.columns and 'nome_spe_cv' in df_clean.columns:
-        # Gaps operacionais calculados apenas sobre as séries temporais limpas de dados nulos
-        df_validos = df_clean.dropna(subset=['val_geracao_conjunto', 'val_ventoverificado']).sort_values(by=['nome_spe_cv', 'din_instante'])
-        df_validos['tempo_diff'] = df_validos.groupby('nome_spe_cv')['din_instante'].diff()
-        gaps = df_validos[df_validos['tempo_diff'] > pd.Timedelta(minutes=45)]
-        
-        if not gaps.empty:
-            for spe, count in gaps.groupby('nome_spe_cv').size().items():
-                gaps_relatorio.append(f" - {spe}: {count} descontinuidades operacionais (>45m) reais encontradas.")
-
-    # =====================================================================
-    # SALVANDO A BASE TRATADA EM PARQUET (CAMINHO GOLD)
-    # =====================================================================
+    # =========================================================
+    # SALVA GOLD PARQUET
+    # =========================================================
     try:
         GOLD_PARQUET_PATH.parent.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Gravando arquivo Parquet tratado em: {GOLD_PARQUET_PATH}...")
         df_clean.to_parquet(GOLD_PARQUET_PATH, index=False, compression="snappy")
-        logger.info("Arquivo Parquet salvo com sucesso!")
+        logger.info(f"Parquet Gold salvo em: {GOLD_PARQUET_PATH}")
     except Exception as e:
-        logger.error(f"Erro ao salvar arquivo Parquet: {e}")
+        logger.error(f"Erro ao salvar Parquet: {e}")
         raise
 
-    # =====================================================================
-    # RELATÓRIO FINAL EXPANDIDO NO TERMINAL
-    # =====================================================================
-    linhas_finais = len(df_clean)
-    perc = (registros_descartados / linhas_iniciais) * 100 if linhas_iniciais > 0 else 0
-    
-    print("\n--- RELATÓRIO DE QUALIDADE E INTEGRIDADE DE DADOS ---")
-    print(f"Total de registros originais: {linhas_iniciais}")
-    print(f"Total de registros após limpeza: {linhas_finais}")
-    print(f"Total de registros descartados (Hard Drop): {registros_descartados} ({perc:.2f}%)")
-    print(f"Total de linhas duplicadas removidas: {duplicatas_iniciais}")
-    
-    print("\n--- ANOMALIAS TRATADAS (SOFT DROPS E ALERTAS) ---")
-    print(f"⚠️ Medições de Vento anuladas (Inválido ou <0/>40): {qtd_vento_nulo} registros")
-    print(f"⚠️ Medições de Geração anuladas (<0): {qtd_geracao_nula} registros")
-    print(f"🚩 Alertas de Regra de Negócio (Limitada > Referência): {qtd_alertas_limitada} registros marcados")
-    
-    print("\n--- FRESHNESS CHECK (ATUALIDADE DA BASE) ---")
-    print(freshness_status)
-    
-    print(f"\n--- COMPLETUDE DA SÉRIE TEMPORAL (LIMITE DE ALERTA: {THRESHOLD_COMPLETUDE}%) ---")
-    if completude_relatorio:
-        for relato in completude_relatorio: print(relato)
-    else:
-        print(" - Não foi possível calcular a completude (colunas ausentes).")
-    
-    print("\n--- CONTINUIDADE TEMPORAL (GAPS OPERACIONAIS) ---")
-    if gaps_relatorio:
-        for relato in gaps_relatorio: print(relato)
-    else:
-        print(" - Perfeito! Todos os timestamps com dados úteis estão contínuos (sem gaps reais de +45min).")
-            
+    # =========================================================
+    # RELATÓRIO NO TERMINAL
+    # =========================================================
+    print("\n--- VOLUMETRIA ---")
+    print(f"  Brutos:                    {linhas_iniciais}")
+    print(f"  Duplicatas idênticas:      -{n_identicas_removidas}")
+    print(f"  Quarentena (conflitantes): -{len(df_dup_conflitantes) if not df_dup_conflitantes.empty else 0}")
+    print(f"  Quarentena (Pandera):      -{len(indices_falhos)}")
+    print(f"  Limpos:                    {len(df_clean)}")
+    if n_quarentena > 0:
+        print(f"  Arquivo de quarentena:     {QUARENTENA_PATH}")
+
+    print("\n--- SOFT DROPS E FLAGS ---")
+    print(f"  Vento anulado:             {qtd_vento_nulo}")
+    print(f"  Geração conj. anulada:     {qtd_geracao_nula}")
+    print(f"  Alertas limitada>ref:      {qtd_alertas}")
+
+    print("\n--- ESTADOS DO VENTO (flg_dadoventoinvalido) ---")
+    print(f"  Válido   (flag=0):         {qtd_flag_valido}")
+    print(f"  Inválido (flag=1, hist.):  {qtd_flag_invalido}")
+    print(f"  Sem dado (flag=NULL):      {qtd_flag_null}")
+
+    print("\n--- INTEGRIDADE REFERENCIAL ---")
+    print(f"  SPEs esperadas: 47 | com dados: {spes_com_dados}")
+    if spes_sem_conj > 0:
+        print(f"  ALERTA: {spes_sem_conj} registros sem conjunto mapeado após o join")
+
+    print(f"\n--- FRESHNESS ---")
+    print(f"  {freshness_info['status']}: {freshness_info['mensagem']}")
+
+    print(f"\n--- COMPLETUDE POR PROJETO (threshold: {THRESHOLD_COMPLETUDE}%) ---")
+    for proj, info in completude_proj.items():
+        alerta_str = " <- ALERTA" if info["alerta"] else ""
+        print(
+            f"  {proj}: envio {info['pct_envio']}% | dados válidos {info['pct_dados_validos']}%"
+            f" ({info['recebido_total']}/{info['esperado_total']}) | gaps: {info['gaps_detectados']}{alerta_str}"
+        )
+        if info["spes_sem_dado"]:
+            print(f"    SPEs sem nenhum dado: {info['spes_sem_dado']}")
+
     print("\n==========================================")
     logger.info("Tratamento via Pandera concluído!")
     return df_clean
