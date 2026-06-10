@@ -45,12 +45,12 @@ flowchart TD
     lt -->|"Silver .parquet"| model
     model -->|"Gold · DuckDB"| api
 
-    classDef gray fill:#f5f5f5,stroke:#666666,color:#333333
-    classDef purple fill:#e1d5e7,stroke:#9673a6,color:#333333
-    classDef teal fill:#b0e3e6,stroke:#0e8088,color:#333333
-    classDef amber fill:#ffe6cc,stroke:#d79b00,color:#333333
-    classDef green fill:#d5e8d4,stroke:#82b366,color:#333333
-    classDef blue fill:#dae8fc,stroke:#6c8ebf,color:#333333
+    classDef gray   fill:#e2e2e2,stroke:#6b7280,color:#111827
+    classDef purple fill:#ddd0ec,stroke:#8a63b8,color:#2e1d4a
+    classDef teal   fill:#bce4e6,stroke:#2a8a90,color:#0d3a3d
+    classDef amber  fill:#ffe2c2,stroke:#cf9420,color:#5c3a08
+    classDef green  fill:#cfe8cd,stroke:#5a9e57,color:#14361a
+    classDef blue   fill:#cfe0fb,stroke:#5a86c9,color:#15294a
 
     class ons gray
     class spescdv green
@@ -60,7 +60,8 @@ flowchart TD
     class model green
     class api blue
 
-    style lt fill:#f3edf7,stroke:#9673a6
+    style lt fill:transparent,stroke:#8a63b8
+    linkStyle default stroke:#9ca3af,stroke-width:1.5px
 ```
 
 | Script | Camada | Responsabilidade |
