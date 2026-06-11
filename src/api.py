@@ -1,3 +1,13 @@
+# ==============================================================================
+# NOME DO SCRIPT: api.py 
+# AUTOR:          Lívia Belo
+# DATA DA VERSÃO: Maio de 2026
+# VERSÃO:         2.0.0
+# DESCRIPTION:    API para disponibilizar dados tratados de geração elétrica 
+#                 e restrições operacionais de parques eólicos. Os dados são
+#                 consultados diretamente da camada Gold (Data Warehouse DuckDB).
+# ==============================================================================
+
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import RedirectResponse
 from datetime import date
