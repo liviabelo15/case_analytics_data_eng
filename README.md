@@ -92,7 +92,7 @@ flowchart TD
 
 Os dados do ONS têm duas granularidades distintas: uma por SPE (aerogerador individual) e outra por conjunto/complexo. Misturá-las em uma única tabela fato causa um problema chamado **fan trap** — ao somar métricas de complexo sobre linhas de SPE, o resultado é multiplicado pelo número de SPEs, gerando valores incorretos silenciosamente.
 
-A solução foi separar em dois fatos com seus grãos naturais:
+A solução foi separar em dois fatos:
 
 - **`fato_geracao_spe`** — 1 linha = 1 SPE × 1 intervalo de 30 min  
   Métricas: vento, geração estimada, geração verificada
@@ -309,6 +309,6 @@ case_analytics_data_eng/
 
 ## Limitações conhecidas da fonte de dados
 
-**Join SPE → Conjunto feito por nome:** O dataset de conjuntos do ONS não tem CEG — o campo aparece como `"-"` para todos os complexos. O único caminho de join disponível é pelo nome da usina (`nom_usina`), em comparação case-insensitive. Essa é uma limitação dos dados abertos do ONS, não do pipeline.
+**Join SPE → Conjunto feito por nome:** O dataset de conjuntos do ONS não tem CEG — o campo aparece como `"-"` para todos os complexos. O único caminho de join disponível é pelo nome da usina (`nom_usina`), em comparação case-insensitive. Essa é uma limitação dos dados abertos do ONS, não do pipeline. Há ainda um caso especial: SPEs do tipo "Tipo II-C" usam o campo `nom_conjuntousina` como referência ao conjunto, não `nom_usina`. Isso é tratado com um `CASE WHEN` no join.
 
 **Unidade de vento no dicionário ONS:** O campo `val_ventoverificado` está descrito como `m³/s` no dicionário oficial — o correto é `m/s`. A validação do pipeline usa o intervalo físico correto de 0 a 40 m/s.
