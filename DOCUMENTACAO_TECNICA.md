@@ -94,7 +94,6 @@ Une os dois datasets do ONS, aplica regras de qualidade e gera um relatório det
 Este pipeline usa **ELT** (Extract → Load → Transform): os dados brutos são carregados primeiro no DuckDB, e as transformações são feitas em SQL dentro do banco.
 
 **Por que ELT aqui?**
-- O DuckDB é otimizado para transformações analíticas — fazer o JOIN entre os dois datasets em SQL é mais rápido e legível que em Python puro
 - As transformações ficam documentadas como queries SQL auditáveis
 - Se precisar reprocessar só uma etapa, é mais fácil re-executar uma query SQL do que um bloco de código Python
 
